@@ -1,4 +1,3 @@
-# ========== Python 基础 ==========
 __pycache__/
 *.py[cod]
 *.pyo
@@ -6,43 +5,26 @@ __pycache__/
 *.pdb
 *.log
 
-# 虚拟环境
 .venv/
 venv/
 env/
 
-# 本地配置
 .env
 .env.*
 
-# IDE / 编辑器
 .vscode/
 .idea/
-*.code-workspace
 .DS_Store
 
-# ========== 本项目特有：大文件 / 运行期产物 ==========
-
-# 本地向量模型
 models/
 
-# 向量数据库（Chroma 持久化）
 vector_db/
 
-# 默认教材与上传教材（PDF 很大，不随仓库分发）
 knowledge_base/
 uploaded_pdfs/
 
-# 预处理与分析产物
 processed_chunks/
 analytics/
 feedback_db/
 
-# 字体与其他二进制资源（可选）
 fonts/
-
-# 其他临时文件
-*.tmp
-*.bak
-*.swp
-*~
