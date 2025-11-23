@@ -1,0 +1,5 @@
+{
+  "name": "MLTutor - AI 智能学习平台",
+  "description": "一个现代化的、美观的 React 应用程序，用于个性化 AI 辅助学习，具有 PDF RAG、智能测验和学习分析功能。",
+  "requestFramePermissions": []
+}
