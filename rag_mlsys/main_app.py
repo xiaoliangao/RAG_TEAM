@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Literal, Tuple
 
@@ -10,14 +11,21 @@ from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
 from rag_service import RAGService
-from core_processing import process_single_pdf
+from core_processing import process_single_pdf, extract_chapter_title
 from learning_tracker import (
     load_quiz_history,
     summarize_history,
     aggregate_knowledge_tags,
-    record_quiz_attempt,   
+    record_quiz_attempt,
+    collect_wrong_questions,
+    build_score_timeline,
+    derive_concept_key,
 )
-from quiz_module.question_generator import generate_quiz_questions
+from quiz_module.question_generator import (
+    generate_quiz_questions,
+    regenerate_question_from_concept,
+)
+from quiz_module.report_generator import generate_diagnostic_report
 
 app = FastAPI(
     title="MLTutor RAG Backend",
@@ -37,17 +45,26 @@ app.add_middleware(
 
 rag_service = RAGService()
 
-_vector_store: Optional[Chroma] = getattr(rag_service, "vector_store", None)
-_embedding_model = getattr(rag_service, "embedding_model", None)
-
-CURRENT_QUIZ_SOURCE: Optional[str] = None
-
-
 class Material(BaseModel):
     id: str
     name: str
     source: str
     kind: Literal["builtin", "uploaded"]
+
+
+class Chapter(BaseModel):
+    id: str
+    title: str
+    material_id: str
+    page_start: Optional[int] = None
+    page_end: Optional[int] = None
+
+
+_vector_store: Optional[Chroma] = getattr(rag_service, "vector_store", None)
+_embedding_model = getattr(rag_service, "embedding_model", None)
+
+CURRENT_QUIZ_SOURCE: Optional[str] = None
+_CHAPTER_CACHE: Dict[str, List[Chapter]] = {}
 
 
 BUILTIN_MATERIALS: List[Material] = [
@@ -111,6 +128,129 @@ def _find_material_by_id(material_id: str) -> Optional[Material]:
     return None
 
 
+def _safe_page(meta: Dict[str, Any]) -> Optional[int]:
+    for key in ("page", "page_number", "page_index"):
+        if key in meta:
+            try:
+                return int(meta[key])
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _slugify_title(text: str) -> str:
+    normalized = re.sub(r"\s+", "-", text.strip())
+    normalized = re.sub(r"[^A-Za-z0-9\-]+", "", normalized)
+    return normalized.lower().strip("-")
+
+
+def _infer_chapter_title(text: str) -> Optional[str]:
+    title = extract_chapter_title(text)
+    if not title:
+        return None
+    return re.sub(r"\s+", " ", title).strip()
+
+
+def _normalize_detected_title(title: Optional[str]) -> Optional[str]:
+    if not title:
+        return None
+    return re.sub(r"\s+", " ", title).strip()
+
+
+def _build_chapter_index(
+    material: Material, docs: List[str], metas: List[Dict[str, Any]]
+) -> List[Chapter]:
+    chapters: List[Chapter] = []
+    chapter_map: Dict[str, Chapter] = {}
+    current_id: Optional[str] = None
+
+    for content, meta in zip(docs, metas):
+        chapter_id = meta.get("chapter_id")
+        title = _normalize_detected_title(meta.get("chapter_title"))
+        if not title:
+            title = _normalize_detected_title(_infer_chapter_title(content))
+        if chapter_id and not title:
+            title = chapter_id
+        if title and not chapter_id:
+            slug = _slugify_title(title) or f"ch{len(chapters) + 1}"
+            chapter_id = f"{material.id}-{slug}"
+
+        if chapter_id:
+            chapter = chapter_map.get(chapter_id)
+            if chapter is None:
+                page = _safe_page(meta)
+                chapter = Chapter(
+                    id=chapter_id,
+                    title=title or chapter_id,
+                    material_id=material.id,
+                    page_start=page,
+                    page_end=page,
+                )
+                chapter_map[chapter_id] = chapter
+                chapters.append(chapter)
+            else:
+                page = _safe_page(meta)
+                if page is not None:
+                    if chapter.page_start is None or page < chapter.page_start:
+                        chapter.page_start = page
+                    if chapter.page_end is None or page > chapter.page_end:
+                        chapter.page_end = page
+            current_id = chapter_id
+        elif current_id:
+            chapter = chapter_map.get(current_id)
+            if chapter:
+                page = _safe_page(meta)
+                if page is not None and (chapter.page_end is None or page > chapter.page_end):
+                    chapter.page_end = page
+
+    chapters.sort(key=lambda ch: ((ch.page_start or 0), ch.title))
+    return chapters
+
+
+def _load_chapters_for_material(material: Material) -> List[Chapter]:
+    if material.id in _CHAPTER_CACHE:
+        return _CHAPTER_CACHE[material.id]
+
+    try:
+        vs = _get_or_create_vector_store()
+    except RuntimeError:
+        return []
+
+    try:
+        data = vs.get(where={"source": material.source})
+    except Exception:
+        _CHAPTER_CACHE[material.id] = []
+        return []
+
+    docs = data.get("documents", [])
+    metas = data.get("metadatas", [])
+    chapters = _build_chapter_index(material, docs, metas)
+    _CHAPTER_CACHE[material.id] = chapters
+    return chapters
+
+
+def _build_retrieval_filter(
+    material: Optional[Material]
+) -> Optional[Dict[str, Any]]:
+    filters: Dict[str, Any] = {}
+    if material:
+        filters["source"] = material.source
+    return filters or None
+
+
+def _next_chapter(material_id: Optional[str], chapter_id: Optional[str]) -> Optional[Chapter]:
+    if not material_id or not chapter_id:
+        return None
+    material = _find_material_by_id(material_id)
+    if not material:
+        return None
+    chapters = _load_chapters_for_material(material)
+    for idx, chapter in enumerate(chapters):
+        if chapter.id == chapter_id and idx + 1 < len(chapters):
+            return chapters[idx + 1]
+    return None
+
+
 class ChatHistoryItem(BaseModel):
     role: Literal["user", "assistant"]
     content: str
@@ -125,6 +265,8 @@ class ChatRequest(BaseModel):
     use_fewshot: bool = True
     use_multi_turn: bool = False
     history: Optional[List[ChatHistoryItem]] = None
+    material_id: Optional[str] = None
+    chapter_id: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
@@ -150,6 +292,7 @@ class QuizGenerateRequest(BaseModel):
     num_boolean: int = 2
     difficulty: QuizDifficulty = "medium"
     material_id: Optional[str] = None
+    chapter_id: Optional[str] = None
 
 class QuizItem(BaseModel):
     id: int
@@ -157,7 +300,14 @@ class QuizItem(BaseModel):
     options: Optional[List[str]] = None
     correct: Optional[str] = None
     explanation: Optional[str] = None
-    qtype: Optional[str] = None  
+    qtype: Optional[str] = None
+    source: Optional[str] = None
+    page: Optional[int] = None
+    chapter_id: Optional[str] = None
+    chapter_title: Optional[str] = None
+    snippet: Optional[str] = None
+    material_id: Optional[str] = None
+    concept_key: Optional[str] = None
 
 
 class QuizGenerateResponse(BaseModel):
@@ -172,17 +322,56 @@ class QuizSubmitQuestion(BaseModel):
     user_answer: Optional[str] = None
     is_correct: Optional[bool] = None
     qtype: Optional[str] = None  # "choice" / "boolean"
+    source: Optional[str] = None
+    page: Optional[int] = None
+    chapter_id: Optional[str] = None
+    chapter_title: Optional[str] = None
+    snippet: Optional[str] = None
+    explanation: Optional[str] = None
+    concept_key: Optional[str] = None
+    material_id: Optional[str] = None
 
 
 class QuizSubmitRequest(BaseModel):
     difficulty: QuizDifficulty
     questions: List[QuizSubmitQuestion]
+    material_id: Optional[str] = None
+    chapter_id: Optional[str] = None
+    num_choice: Optional[int] = None
+    num_boolean: Optional[int] = None
+    mode: Literal["standard", "review"] = "standard"
 
 
 class QuizSubmitResponse(BaseModel):
     score_raw: int
     score_total: int
     score_percentage: float
+    next_chapter: Optional[Chapter] = None
+
+
+class WrongQuestion(BaseModel):
+    id: int
+    stem: str
+    options: List[str]
+    correct: Optional[str]
+    qtype: Optional[str] = None
+    explanation: Optional[str] = None
+    source: Optional[str] = None
+    page: Optional[int] = None
+    chapter_id: Optional[str] = None
+    chapter_title: Optional[str] = None
+    snippet: Optional[str] = None
+    concept_key: Optional[str] = None
+    material_id: Optional[str] = None
+
+
+class StudyDiagnosticResponse(BaseModel):
+    markdown: str
+
+
+class ScorePoint(BaseModel):
+    ts: Optional[str]
+    score: float
 
 class StudyOverview(BaseModel):
     attempts: int
@@ -249,6 +438,14 @@ def api_chat(req: ChatRequest) -> ChatResponse:
         if req.history:
             history_list = [h.model_dump() for h in req.history]
 
+        material: Optional[Material] = None
+        if req.material_id:
+            material = _find_material_by_id(req.material_id)
+            if material is None:
+                raise HTTPException(status_code=400, detail=f"未知教材: {req.material_id}")
+
+        filters = _build_retrieval_filter(material)
+
         answer, sources = rag_service.answer(
             req.question,
             temperature=req.temperature,
@@ -258,6 +455,7 @@ def api_chat(req: ChatRequest) -> ChatResponse:
             use_fewshot=req.use_fewshot,
             use_multi_turn=req.use_multi_turn,
             history=history_list,
+            filters=filters,
         )
         return ChatResponse(answer=answer, sources=sources)
     except Exception as e:
@@ -304,6 +502,7 @@ async def api_upload(file: UploadFile = File(...)) -> UploadResponse:
         # 记录为当前测验教材
         global CURRENT_QUIZ_SOURCE
         CURRENT_QUIZ_SOURCE = str(save_path)
+        _CHAPTER_CACHE.clear()
 
         return UploadResponse(filename=file.filename, chunk_count=chunk_count)
     except HTTPException:
@@ -317,21 +516,16 @@ def api_materials() -> MaterialsResponse:
     """
     返回内置教材 + 已上传教材列表。
     """
-    uploaded_dir = Path("./uploaded_pdfs")
-    uploaded=_load_uploaded_materials()
-
-    if uploaded_dir.exists():
-        for pdf in sorted(uploaded_dir.glob("*.pdf")):
-            uploaded.append(
-                Material(
-                    id=pdf.stem,
-                    name=pdf.name,
-                    source=str(pdf),
-                    kind="uploaded",
-                )
-            )
-
+    uploaded = _load_uploaded_materials()
     return MaterialsResponse(builtins=BUILTIN_MATERIALS, uploaded=uploaded)
+
+
+@app.get("/api/materials/{material_id}/chapters", response_model=List[Chapter])
+def api_get_chapters(material_id: str) -> List[Chapter]:
+    material = _find_material_by_id(material_id)
+    if material is None:
+        raise HTTPException(status_code=404, detail=f"未知教材: {material_id}")
+    return _load_chapters_for_material(material)
 
 
 @app.post("/api/quiz/generate", response_model=QuizGenerateResponse)
@@ -352,12 +546,15 @@ def api_generate_quiz(req: QuizGenerateRequest) -> QuizGenerateResponse:
         if selected_material is None:
             raise HTTPException(status_code=400, detail=f"未知教材: {req.material_id}")
 
-    search_kwargs: Dict[str, Any] = {"k": 8}
-
+    search_filters: Dict[str, Any] = {}
     if selected_material is not None:
-        search_kwargs["filter"] = {"source": selected_material.source}
+        search_filters["source"] = selected_material.source
     elif CURRENT_QUIZ_SOURCE:
-        search_kwargs["filter"] = {"source": CURRENT_QUIZ_SOURCE}
+        search_filters["source"] = CURRENT_QUIZ_SOURCE
+
+    search_kwargs: Dict[str, Any] = {"k": 8}
+    if search_filters:
+        search_kwargs["filter"] = search_filters
 
     quiz_retriever = vs.as_retriever(search_kwargs=search_kwargs)
 
@@ -380,6 +577,7 @@ def api_generate_quiz(req: QuizGenerateRequest) -> QuizGenerateResponse:
         stem = q.get("stem") or q.get("question") or ""
         options = q.get("options") or []
         qtype = q.get("type") or "choice"
+        material_id = q.get("material_id") or (selected_material.id if selected_material else req.material_id)
 
         correct_value: Optional[str] = None
         idx = q.get("correct_answer_index")
@@ -389,6 +587,17 @@ def api_generate_quiz(req: QuizGenerateRequest) -> QuizGenerateResponse:
             correct_value = q.get("correct") or q.get("correct_answer")
 
         explanation = q.get("explanation") or q.get("analysis")
+        concept_key = derive_concept_key(
+            {
+                "concept_key": q.get("concept_key"),
+                "stem": stem,
+                "question": stem,
+                "source": q.get("source"),
+                "page": q.get("page"),
+                "chapter_id": q.get("chapter_id"),
+                "snippet": q.get("snippet"),
+            }
+        )
 
         items.append(
             QuizItem(
@@ -398,6 +607,13 @@ def api_generate_quiz(req: QuizGenerateRequest) -> QuizGenerateResponse:
                 correct=correct_value,
                 explanation=explanation,
                 qtype=qtype,
+                source=q.get("source"),
+                page=q.get("page"),
+                chapter_id=q.get("chapter_id"),
+                chapter_title=q.get("chapter_title"),
+                snippet=q.get("snippet"),
+                material_id=material_id,
+                concept_key=concept_key,
             )
         )
 
@@ -414,28 +630,45 @@ def api_quiz_submit(req: QuizSubmitRequest) -> QuizSubmitResponse:
     if not req.questions:
         raise HTTPException(status_code=400, detail="没有题目，无法记录测验。")
 
+    material: Optional[Material] = None
+    if req.material_id:
+        material = _find_material_by_id(req.material_id)
+    base_material_id = material.id if material else req.material_id
+
     results: List[Dict[str, Any]] = []
+    score_raw = 0
 
     for q in req.questions:
         qtype = q.qtype or ("choice" if q.options else "boolean")
-        user_answer = q.user_answer or ""
-        is_correct = bool(q.is_correct)
-        is_unanswered = user_answer.strip() == ""
+        user_answer = (q.user_answer or "").strip()
+        correct_answer = (q.correct or "").strip()
+        is_unanswered = user_answer == ""
+        is_correct = bool(user_answer and correct_answer and user_answer.lower() == correct_answer.lower())
+        if is_correct:
+            score_raw += 1
 
         results.append(
             {
+                "id": q.id,
                 "question": q.stem,
                 "type": qtype,
-                "options": q.options,
+                "options": q.options or [],
                 "correct_answer": q.correct,
-                "user_answer": user_answer,
+                "user_answer": q.user_answer,
                 "is_correct": is_correct,
                 "is_unanswered": is_unanswered,
+                "explanation": q.explanation,
+                "source": q.source,
+                "page": q.page,
+                "chapter_id": q.chapter_id,
+                "chapter_title": q.chapter_title,
+                "snippet": q.snippet,
+                "concept_key": q.concept_key,
+                "material_id": q.material_id or base_material_id,
             }
         )
 
     score_total = len(results)
-    score_raw = sum(1 for r in results if r.get("is_correct"))
     score_percentage = float(score_raw) / score_total * 100.0 if score_total > 0 else 0.0
 
     report_obj: Dict[str, Any] = {
@@ -447,8 +680,14 @@ def api_quiz_submit(req: QuizSubmitRequest) -> QuizSubmitResponse:
 
     metadata: Dict[str, Any] = {
         "difficulty": req.difficulty,
-        "source": CURRENT_QUIZ_SOURCE or "builtin",
-        "mode": "upload_only" if CURRENT_QUIZ_SOURCE else "builtin_only",
+        "source": (material.source if material else CURRENT_QUIZ_SOURCE or "builtin"),
+        "mode": req.mode,
+        "material_id": material.id if material else req.material_id,
+        "material_name": material.name if material else None,
+        "chapter_id": results[0].get("chapter_id") if results else None,
+        "chapter_title": results[0].get("chapter_title") if results else None,
+        "num_choice": req.num_choice,
+        "num_boolean": req.num_boolean,
     }
 
     try:
@@ -456,11 +695,95 @@ def api_quiz_submit(req: QuizSubmitRequest) -> QuizSubmitResponse:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"记录测验历史失败: {e}")
 
+    next_chapter = _next_chapter(metadata.get("material_id"), metadata.get("chapter_id"))
+
     return QuizSubmitResponse(
         score_raw=score_raw,
         score_total=score_total,
         score_percentage=score_percentage,
+        next_chapter=next_chapter,
     )
+
+
+@app.get("/api/quiz/wrong", response_model=List[WrongQuestion])
+def api_get_wrong_questions(
+    limit: int = 50,
+    material_id: Optional[str] = None,
+    chapter_id: Optional[str] = None,
+) -> List[WrongQuestion]:
+    history = load_quiz_history(limit=200)
+    wrong_items = collect_wrong_questions(
+        history,
+        limit=limit,
+        material_id=material_id,
+        chapter_id=chapter_id,
+    )
+    response: List[WrongQuestion] = []
+    for idx, item in enumerate(wrong_items):
+        concept_seed = item.get("snippet") or item.get("stem") or ""
+        qtype = item.get("type") or ("boolean" if len(item.get("options") or []) == 2 else "choice")
+        meta = {
+            "source": item.get("source"),
+            "page": item.get("page"),
+            "chapter_id": item.get("chapter_id"),
+            "chapter_title": item.get("chapter_title"),
+            "material_id": item.get("material_id") or material_id,
+        }
+        regenerated = regenerate_question_from_concept(
+            concept_seed,
+            metadata=meta,
+            difficulty="medium",
+            q_type=qtype or "choice",
+            avoid_question=item.get("previous_question") or item.get("stem"),
+        )
+
+        stem = item.get("stem") or ""
+        options = item.get("options") or []
+        correct_value = item.get("correct")
+        explanation = item.get("explanation")
+        snippet = item.get("snippet")
+        material_value = meta.get("material_id")
+
+        if regenerated:
+            stem = regenerated.get("question") or regenerated.get("stem") or stem
+            options = regenerated.get("options") or options
+            idx_answer = regenerated.get("correct_answer_index")
+            if isinstance(idx_answer, int) and 0 <= idx_answer < len(options):
+                correct_value = options[idx_answer]
+            explanation = regenerated.get("explanation") or explanation
+            snippet = regenerated.get("snippet") or snippet
+            material_value = regenerated.get("material_id") or material_value
+            qtype = regenerated.get("type") or qtype
+
+        concept_key = item.get("concept_key") or derive_concept_key(
+            {
+                "stem": stem,
+                "question": stem,
+                "source": item.get("source"),
+                "page": item.get("page"),
+                "chapter_id": item.get("chapter_id"),
+                "snippet": snippet,
+            }
+        )
+
+        response.append(
+            WrongQuestion(
+                id=idx + 1,
+                stem=stem,
+                options=options,
+                correct=correct_value,
+                explanation=explanation,
+                source=item.get("source"),
+                page=item.get("page"),
+                chapter_id=item.get("chapter_id"),
+                chapter_title=item.get("chapter_title"),
+                snippet=snippet,
+                qtype=qtype,
+                concept_key=concept_key,
+                material_id=material_value,
+            )
+        )
+    return response
 
 
 @app.get("/api/report/overview", response_model=StudyReportOverview)
@@ -482,3 +805,22 @@ def api_report_overview() -> StudyReportOverview:
     focus_topics = [tag for tag, _ in tag_counts]
 
     return StudyReportOverview(overview=overview, focus_topics=focus_topics)
+
+
+@app.get("/api/report/diagnostic", response_model=StudyDiagnosticResponse)
+def api_report_diagnostic(
+    limit: int = 10,
+    material_id: Optional[str] = None,
+) -> StudyDiagnosticResponse:
+    history = load_quiz_history(limit=limit)
+    if material_id:
+        history = [h for h in history if h.get("material_id") == material_id]
+    md = generate_diagnostic_report(history)
+    return StudyDiagnosticResponse(markdown=md)
+
+
+@app.get("/api/report/timeline", response_model=List[ScorePoint])
+def api_report_timeline(limit: int = 50) -> List[ScorePoint]:
+    history = load_quiz_history(limit=limit)
+    timeline = build_score_timeline(history)
+    return [ScorePoint(ts=item.get("ts"), score=float(item.get("score", 0.0))) for item in timeline]

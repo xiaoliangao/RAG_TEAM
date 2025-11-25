@@ -1,7 +1,14 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Sliders, Play, Check, X, Award, RefreshCcw, BookOpen } from 'lucide-react';
-import { generateQuiz } from '../api/client';
-import type { MaterialsResponse, QuizQuestion, QuizResult, QuizSessionState } from '../types';
+import { Sliders, Play, Check, X, Award, RefreshCcw } from 'lucide-react';
+import { generateQuiz, fetchWrongQuestions, submitQuizAnswers } from '../api/client';
+import type {
+  Material,
+  MaterialsResponse,
+  QuizQuestion,
+  QuizResult,
+  QuizSessionState,
+  QuizSubmitRequestPayload,
+} from '../types';
 
 interface QuizViewProps {
   onFinish: (result: QuizResult) => void;
@@ -10,12 +17,26 @@ interface QuizViewProps {
   materialsError?: string | null;
   session: QuizSessionState;
   updateSession: React.Dispatch<React.SetStateAction<QuizSessionState>>;
+  currentMaterial: Material | null;
+  selectedMaterialId: string | null;
 }
 
-const QuizView: React.FC<QuizViewProps> = ({ onFinish, materials, refreshMaterials, materialsError, session, updateSession }) => {
-  const { stage, questions, answers, config, selectedMaterial, result } = session;
+const QuizView: React.FC<QuizViewProps> = ({
+  onFinish,
+  materials,
+  refreshMaterials,
+  materialsError,
+  session,
+  updateSession,
+  currentMaterial,
+  selectedMaterialId,
+}) => {
+  const { stage, questions, answers, config, result, mode } = session;
   const [quizError, setQuizError] = useState<string | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [expandedSnippet, setExpandedSnippet] = useState<number | null>(null);
+  const [openExplanations, setOpenExplanations] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
     if (!materials) {
@@ -23,13 +44,27 @@ const QuizView: React.FC<QuizViewProps> = ({ onFinish, materials, refreshMateria
     }
   }, [materials, refreshMaterials]);
 
-  const materialOptions = useMemo(() => {
-    if (!materials) return [];
-    return [
-      ...materials.uploaded.map((mat) => ({ id: mat.id, label: `${mat.name}（上传）` })),
-      ...materials.builtins.map((mat) => ({ id: mat.id, label: `${mat.name}（内置）` })),
-    ];
+  const materialNameMap = useMemo(() => {
+    const map: Record<string, string> = {};
+    if (materials) {
+      materials.uploaded.forEach((mat) => { map[mat.id] = mat.name; });
+      materials.builtins.forEach((mat) => { map[mat.id] = mat.name; });
+    }
+    return map;
   }, [materials]);
+  const resolvedMaterialId = currentMaterial?.id ?? selectedMaterialId ?? null;
+  const selectedMaterialName = currentMaterial?.name
+    ? currentMaterial.name
+    : (resolvedMaterialId ? (materialNameMap[resolvedMaterialId] ?? '未知教材') : '未选择教材');
+  const formatSource = (item: QuizQuestion) => {
+    if (item.chapter_title) return item.chapter_title;
+    if (item.material_id && materialNameMap[item.material_id]) return materialNameMap[item.material_id];
+    if (item.source) {
+      const parts = item.source.split(/[\\/]/);
+      return parts[parts.length - 1] || item.source;
+    }
+    return '未知教材';
+  };
 
   const resolveOptions = (q: QuizQuestion): string[] => {
     if (q.options && q.options.length > 0) return q.options;
@@ -41,13 +76,32 @@ const QuizView: React.FC<QuizViewProps> = ({ onFinish, materials, refreshMateria
 
   const startQuiz = async () => {
     setQuizError(null);
+    setExpandedSnippet(null);
     setIsGenerating(true);
     try {
+      const totalCount = config.choice + config.boolean;
+      if (mode === 'review') {
+        const wrong = await fetchWrongQuestions({
+          limit: Math.max(totalCount, 1),
+          material_id: resolvedMaterialId,
+        });
+        if (!wrong.length) {
+          throw new Error('暂未收集到错题，先完成一次测验吧');
+        }
+        updateSession(prev => ({
+          ...prev,
+          questions: wrong.slice(0, totalCount || wrong.length),
+          stage: 'answering',
+          answers: {},
+          result: null,
+        }));
+        return;
+      }
       const payload = {
         num_choice: config.choice,
         num_boolean: config.boolean,
         difficulty: config.difficulty,
-        material_id: selectedMaterial === 'auto' ? undefined : selectedMaterial,
+        material_id: resolvedMaterialId,
       };
       const data = await generateQuiz(payload);
       if (!data.questions.length) {
@@ -68,7 +122,7 @@ const QuizView: React.FC<QuizViewProps> = ({ onFinish, materials, refreshMateria
     }
   };
 
-  const submitQuiz = () => {
+  const submitQuiz = async () => {
     let correct = 0;
     const results = questions.map((q) => {
       const userAnswer = answers[q.id] ?? null;
@@ -82,6 +136,11 @@ const QuizView: React.FC<QuizViewProps> = ({ onFinish, materials, refreshMateria
         userAnswer,
         correctAnswer: q.correct ?? undefined,
         questionText: q.stem ?? q.question,
+        source: q.source,
+        page: q.page,
+        chapter_id: q.chapter_id ?? null,
+        chapter_title: q.chapter_title,
+        snippet: q.snippet,
       };
     });
 
@@ -91,7 +150,33 @@ const QuizView: React.FC<QuizViewProps> = ({ onFinish, materials, refreshMateria
       wrong: questions.length - correct,
       scorePercentage: questions.length ? (correct / questions.length) * 100 : 0,
       results,
+      nextChapter: null,
     };
+
+    const payload: QuizSubmitRequestPayload = {
+      difficulty: config.difficulty,
+      questions: questions.map((q) => ({
+        ...q,
+        stem: q.stem ?? q.question ?? '',
+        user_answer: answers[q.id] ?? null,
+        chapter_id: q.chapter_id ?? null,
+      })),
+      material_id: resolvedMaterialId,
+      num_choice: config.choice,
+      num_boolean: config.boolean,
+      mode: mode === 'review' ? 'review' : 'standard',
+    };
+
+    setIsSubmitting(true);
+    try {
+      const serverRes = await submitQuizAnswers(payload);
+      res.nextChapter = serverRes.next_chapter ?? null;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '记录测验失败（不影响结果展示）';
+      setQuizError(message);
+    } finally {
+      setIsSubmitting(false);
+    }
 
     updateSession(prev => ({
       ...prev,
@@ -106,21 +191,21 @@ const QuizView: React.FC<QuizViewProps> = ({ onFinish, materials, refreshMateria
 
   if (stage === 'config') {
     return (
-      <div className="max-w-2xl mx-auto mt-10">
-        <div className="bg-white rounded-[2rem] border border-slate-200/60 shadow-xl shadow-slate-200/40 p-10">
+      <div className="max-w-5xl mx-auto mt-10">
+        <div className="glass-panel rounded-[2rem] border border-white/70 shadow-xl shadow-indigo-100/60 p-10 min-h-[520px]">
           <div className="flex items-center gap-4 mb-8">
-            <div className="w-14 h-14 bg-indigo-50 rounded-2xl flex items-center justify-center text-indigo-600 shadow-sm">
+            <div className="w-14 h-14 bg-gradient-to-br from-indigo-500 to-violet-600 rounded-2xl flex items-center justify-center text-white shadow-lg shadow-indigo-200">
                 <Sliders size={28} />
             </div>
             <div>
-                <h2 className="text-2xl font-bold text-slate-900">测验配置</h2>
+                <h2 className="text-2xl font-semibold text-slate-900">测验配置</h2>
                 <p className="text-slate-500 font-medium">定制您的专属练习参数</p>
             </div>
           </div>
 
           <div className="space-y-8 mb-10">
             <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-              <div className="bg-slate-50 p-5 rounded-2xl border border-slate-100">
+              <div className="bg-white/70 p-5 rounded-2xl border border-white/70 shadow-sm">
                   <label className="text-sm font-bold text-slate-700 mb-3 block">选择题数量</label>
                   <div className="flex items-center gap-4">
                       <input 
@@ -136,7 +221,7 @@ const QuizView: React.FC<QuizViewProps> = ({ onFinish, materials, refreshMateria
                   </div>
               </div>
 
-              <div className="bg-slate-50 p-5 rounded-2xl border border-slate-100">
+              <div className="bg-white/70 p-5 rounded-2xl border border-white/70 shadow-sm">
                   <label className="text-sm font-bold text-slate-700 mb-3 block">判断题数量</label>
                   <div className="flex items-center gap-4">
                       <input 
@@ -167,7 +252,7 @@ const QuizView: React.FC<QuizViewProps> = ({ onFinish, materials, refreshMateria
                             ...prev,
                             config: { ...prev.config, difficulty: level.id as 'easy' | 'medium' | 'hard' }
                           }))}
-                          className={`py-4 rounded-2xl text-sm font-bold border transition-all duration-200 ${config.difficulty === level.id ? 'border-indigo-600 bg-indigo-600 text-white shadow-lg shadow-indigo-200' : 'border-slate-200 hover:border-indigo-300 text-slate-600 bg-white'}`}
+                          className={`py-4 rounded-2xl text-sm font-bold border transition-all duration-200 ${config.difficulty === level.id ? 'border-indigo-200 bg-gradient-to-r from-indigo-500 to-violet-600 text-white shadow-lg shadow-indigo-200' : 'border-white/70 hover:border-indigo-300 text-slate-600 bg-white/70'}`}
                       >
                           {level.label}
                       </button>
@@ -175,33 +260,43 @@ const QuizView: React.FC<QuizViewProps> = ({ onFinish, materials, refreshMateria
               </div>
             </div>
 
-            <div className="bg-slate-50 p-5 rounded-2xl border border-slate-100">
-              <label className="text-sm font-bold text-slate-700 mb-3 block">出题教材</label>
-              <div className="space-y-3">
-                <select
-                  value={selectedMaterial}
-                  onChange={(e) => updateSession(prev => ({ ...prev, selectedMaterial: e.target.value }))}
-                  className="w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-200 focus:border-indigo-400"
-                >
-                  <option value="auto">自动选择（最近上传优先）</option>
-                  {materialOptions.map((opt) => (
-                    <option key={opt.id} value={opt.id}>{opt.label}</option>
-                  ))}
-                </select>
-                {!materials && (
-                  <p className="text-xs text-slate-400 flex items-center gap-2">
-                    <BookOpen size={14} /> 正在获取教材...
-                  </p>
-                )}
-                {materialsError && (
-                  <p className="text-xs text-red-500">{materialsError}</p>
-                )}
+            <div>
+              <label className="text-sm font-bold text-slate-700 mb-3 block">测验模式</label>
+              <div className="grid grid-cols-2 gap-4">
+                {[
+                  { id: 'standard', label: '标准出题' },
+                  { id: 'review', label: '错题重做' },
+                ].map((item) => (
+                  <button
+                    key={item.id}
+                    onClick={() => updateSession(prev => ({ ...prev, mode: item.id as 'standard' | 'review' }))}
+                    className={`py-4 rounded-2xl text-sm font-bold border transition-all duration-200 ${
+                      mode === item.id ? 'border-indigo-200 bg-gradient-to-r from-indigo-500 to-violet-600 text-white shadow-lg shadow-indigo-200' : 'border-white/70 hover:border-indigo-300 text-slate-600 bg-white/70'
+                    }`}
+                  >
+                    {item.label}
+                  </button>
+                ))}
               </div>
+              {mode === 'review' && (
+                <p className="text-xs text-amber-600 mt-2">将从当前教材的历史错题中抽取试题。</p>
+              )}
+            </div>
+
+            <div className="bg-white/70 p-5 rounded-2xl border border-white/70 shadow-sm">
+              <label className="text-sm font-bold text-slate-700 mb-3 block">当前学习范围</label>
+              <div className="text-sm text-slate-700 space-y-1">
+                <p>教材：<span className="font-semibold text-slate-900">{selectedMaterialName}</span></p>
+              </div>
+              <p className="text-xs text-slate-400 mt-3">系统会基于整本教材生成题目与错题重练。</p>
+              {materialsError && (
+                <p className="text-xs text-rose-600 mt-2">{materialsError}</p>
+              )}
             </div>
           </div>
 
           {quizError && (
-            <div className="mb-4 rounded-2xl border border-red-100 bg-red-50 px-4 py-3 text-sm font-semibold text-red-600">
+            <div className="mb-4 rounded-2xl border border-rose-200 bg-rose-100 px-4 py-3 text-sm font-semibold text-rose-700">
               {quizError}
             </div>
           )}
@@ -209,7 +304,7 @@ const QuizView: React.FC<QuizViewProps> = ({ onFinish, materials, refreshMateria
           <button 
             onClick={startQuiz}
             disabled={isGenerating}
-            className="w-full py-4 bg-slate-900 text-white rounded-2xl font-bold text-lg hover:bg-slate-800 hover:shadow-lg hover:-translate-y-0.5 transition-all flex items-center justify-center gap-3 disabled:opacity-60 disabled:hover:translate-y-0"
+            className="w-full py-4 bg-gradient-to-r from-indigo-500 to-violet-600 text-white rounded-2xl font-bold text-lg hover:shadow-lg hover:shadow-indigo-200 hover:-translate-y-0.5 transition-all flex items-center justify-center gap-3 disabled:opacity-60 disabled:hover:translate-y-0"
           >
             <Play size={20} fill="currentColor" />
             {isGenerating ? '正在生成...' : '生成测验'}
@@ -223,29 +318,29 @@ const QuizView: React.FC<QuizViewProps> = ({ onFinish, materials, refreshMateria
     return (
       <div className="max-w-3xl mx-auto space-y-8">
         {/* Progress Header */}
-        <div className="flex items-center justify-between bg-white/80 backdrop-blur-md p-4 rounded-2xl border border-slate-200 shadow-sm sticky top-4 z-20">
+        <div className="flex items-center justify-between bg-white/80 backdrop-blur-md p-4 rounded-2xl border border-white/70 shadow-sm sticky top-4 z-20">
             <div className="flex items-center gap-4 px-2">
                 <div className="h-2 w-32 bg-slate-100 rounded-full overflow-hidden">
                   <div 
                     className="h-full bg-indigo-600 transition-all duration-500"
                     style={{ width: `${progressPercent}%` }}
-                  />
-                </div>
-                <span className="text-sm font-bold text-slate-600">已答 {answeredCount} / {questions.length}</span>
+                />
+              </div>
+              <span className="text-sm font-bold text-slate-600">已答 {answeredCount} / {questions.length}</span>
             </div>
             <button 
-              onClick={submitQuiz} 
-              disabled={answeredCount !== questions.length}
-              className="px-6 py-2 bg-indigo-600 text-white text-sm font-bold rounded-xl hover:bg-indigo-700 disabled:opacity-50 disabled:hover:bg-indigo-600 transition-all shadow-sm shadow-indigo-200"
+              onClick={() => void submitQuiz()} 
+              disabled={answeredCount !== questions.length || isSubmitting}
+              className="px-6 py-2 bg-gradient-to-r from-indigo-500 to-violet-600 text-white text-sm font-bold rounded-xl hover:shadow-lg hover:shadow-indigo-200 disabled:opacity-50 transition-all shadow-sm shadow-indigo-200"
             >
-                提交答案
+                {isSubmitting ? '提交中...' : '提交答案'}
             </button>
         </div>
 
         {questions.map((q, idx) => {
           const options = resolveOptions(q);
           return (
-            <div key={q.id} className="bg-white p-8 rounded-[2rem] border border-slate-200/60 shadow-sm">
+            <div key={q.id} className="glass-panel p-8 rounded-[2rem] border border-white/70 shadow-sm">
               <div className="flex items-center gap-3 mb-6">
                   <span className={`text-[10px] uppercase tracking-wider font-bold px-3 py-1.5 rounded-lg text-white shadow-sm ${(q.qtype ?? q.type) === 'boolean' ? 'bg-emerald-500' : 'bg-indigo-500'}`}>
                       {(q.qtype ?? q.type) === 'boolean' ? '判断题' : '选择题'}
@@ -306,24 +401,26 @@ const QuizView: React.FC<QuizViewProps> = ({ onFinish, materials, refreshMateria
 
   return (
     <div className="max-w-4xl mx-auto">
-        <div className="bg-white rounded-[2.5rem] border border-slate-200 shadow-2xl shadow-slate-200/50 overflow-hidden mb-10">
-            <div className="bg-slate-900 p-10 text-white text-center relative overflow-hidden">
+        <div className="bg-white rounded-2xl border border-slate-200 shadow-2xl shadow-slate-200/50 overflow-hidden mb-10">
+            <div className="relative p-10 text-center overflow-hidden bg-gradient-to-br from-indigo-900 via-slate-900 to-slate-800 text-white">
+                <div className="absolute inset-0 bg-[radial-gradient(circle_at_30%_20%,rgba(255,255,255,0.08),transparent_45%),radial-gradient(circle_at_80%_0,rgba(129,140,248,0.18),transparent_35%)]" />
+                <div className="absolute inset-0 pointer-events-none">
+                  <div className="absolute -bottom-16 left-1/2 w-80 h-80 -translate-x-1/2 bg-indigo-500/20 blur-[90px]" />
+                </div>
                 <div className="relative z-10">
-                    <div className="inline-flex items-center justify-center w-20 h-20 rounded-full bg-white/10 backdrop-blur-md mb-6 border border-white/20 shadow-lg">
-                        <Award size={40} className="text-yellow-400 drop-shadow-md" />
+                    <div className="inline-flex items-center justify-center w-20 h-20 rounded-full bg-white/10 backdrop-blur-md mb-6 border border-white/20 shadow-lg shadow-indigo-500/30">
+                        <Award size={40} className="text-yellow-300 drop-shadow-md" />
                     </div>
                     <h2 className="text-4xl font-bold mb-2 tracking-tight">测验完成！</h2>
-                    <p className="text-slate-400 font-medium text-lg">以下是您的详细表现报告</p>
+                    <p className="text-indigo-100 font-medium text-lg">以下是您的详细表现报告</p>
                 </div>
-                <div className="absolute top-0 right-0 w-96 h-96 bg-indigo-600/20 rounded-full blur-[100px] -translate-y-1/2 translate-x-1/4 pointer-events-none"></div>
-                <div className="absolute bottom-0 left-0 w-64 h-64 bg-blue-500/20 rounded-full blur-[80px] translate-y-1/2 -translate-x-1/4 pointer-events-none"></div>
             </div>
             
             <div className="grid grid-cols-2 md:grid-cols-4 gap-px bg-slate-100 border-b border-slate-100">
                 {[
                     { label: '最终得分', val: result ? `${result.scorePercentage.toFixed(0)}` : '-', color: 'text-indigo-600' },
                     { label: '答对题数', val: result?.correct ?? '-', color: 'text-emerald-600' },
-                    { label: '错题数', val: result?.wrong ?? '-', color: 'text-red-600' },
+                    { label: '错题数', val: result?.wrong ?? '-', color: 'text-rose-700' },
                     { label: '总题数', val: result?.total ?? '-', color: 'text-slate-900' }
                 ].map((stat, i) => (
                     <div key={i} className="text-center p-6 bg-white group hover:bg-slate-50 transition-colors">
@@ -332,6 +429,12 @@ const QuizView: React.FC<QuizViewProps> = ({ onFinish, materials, refreshMateria
                     </div>
                 ))}
             </div>
+
+            {quizError && (
+              <div className="mx-10 my-6 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                {quizError}
+              </div>
+            )}
 
             <div className="p-10 bg-slate-50/50">
                 <h3 className="font-bold text-slate-900 text-xl mb-8 flex items-center gap-2">
@@ -343,10 +446,11 @@ const QuizView: React.FC<QuizViewProps> = ({ onFinish, materials, refreshMateria
                         const isCorrect = res?.isCorrect;
                         const options = resolveOptions(q);
 
+                        const expanded = openExplanations[q.id] ?? false;
                         return (
-                            <div key={q.id} className={`bg-white rounded-2xl border p-6 transition-shadow hover:shadow-md ${isCorrect ? 'border-emerald-100 shadow-sm' : 'border-red-100 shadow-sm'}`}>
+                            <div key={q.id} className={`bg-white rounded-2xl border p-6 transition-shadow hover:shadow-md ${isCorrect ? 'border-emerald-100 shadow-sm' : 'border-rose-100 shadow-sm'}`}>
                                 <div className="flex items-start gap-4 mb-4">
-                                    <div className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 ${isCorrect ? 'bg-emerald-100 text-emerald-600' : 'bg-red-100 text-red-600'}`}>
+                                    <div className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 ${isCorrect ? 'bg-emerald-100 text-emerald-600' : 'bg-rose-100 text-rose-700'}`}>
                                         {isCorrect ? <Check size={18} strokeWidth={3} /> : <X size={18} strokeWidth={3} />}
                                     </div>
                                     <div>
@@ -355,13 +459,21 @@ const QuizView: React.FC<QuizViewProps> = ({ onFinish, materials, refreshMateria
                                             {options.map((opt) => {
                                                 const isRight = (q.correct ?? '').trim().toLowerCase() === opt.trim().toLowerCase();
                                                 const isUser = res?.userAnswer?.trim().toLowerCase() === opt.trim().toLowerCase();
-                                                let style = "bg-slate-50 text-slate-500 border-slate-100";
-                                                if (isRight) style = "bg-emerald-50 text-emerald-700 border-emerald-200 font-bold ring-1 ring-emerald-200";
-                                                if (isUser && !isRight) style = "bg-red-50 text-red-700 border-red-200 font-bold ring-1 ring-red-200 line-through decoration-2";
+                                                let style = "border-slate-200 bg-white text-slate-600 hover:border-indigo-100";
+                                                let icon: React.ReactNode = null;
+                                                if (isRight) {
+                                                  style = "border-emerald-200 bg-emerald-50 text-emerald-700 font-semibold shadow-[0_6px_18px_-10px_rgba(16,185,129,0.8)]";
+                                                  icon = <Check size={14} />;
+                                                }
+                                                if (isUser && !isRight) {
+                                                  style = "border-rose-200 bg-rose-50 text-rose-700 font-semibold shadow-[0_6px_18px_-10px_rgba(244,63,94,0.15)]";
+                                                  icon = <X size={14} />;
+                                                }
                                                 
                                                 return (
-                                                    <span key={opt} className={`text-sm px-4 py-2 rounded-lg border ${style}`}>
-                                                        {opt} {isRight && "✓"}
+                                                    <span key={opt} className={`inline-flex items-center gap-2 text-sm px-4 py-2 rounded-xl border transition-all ${style}`}>
+                                                        {icon}
+                                                        {opt}
                                                     </span>
                                                 );
                                             })}
@@ -372,9 +484,36 @@ const QuizView: React.FC<QuizViewProps> = ({ onFinish, materials, refreshMateria
                                     </div>
                                 </div>
                                 {q.explanation && (
-                                  <div className="mt-4 ml-12 p-5 bg-slate-50/80 rounded-xl text-sm text-slate-700 leading-relaxed border-l-4 border-indigo-400">
-                                      <span className="font-bold text-indigo-900 block mb-1">💡 解析：</span> 
-                                      {q.explanation}
+                                  <div className="mt-4 ml-12 space-y-3">
+                                    <button
+                                      onClick={() => setOpenExplanations(prev => ({ ...prev, [q.id]: !expanded }))}
+                                      className="text-sm font-semibold text-indigo-600 flex items-center gap-1 hover:underline"
+                                    >
+                                      {expanded ? '收起解析' : '查看解析'}
+                                    </button>
+                                    {expanded && (
+                                      <div className="p-5 bg-slate-50/80 rounded-xl text-sm text-slate-700 leading-relaxed border border-indigo-100 shadow-sm">
+                                        <span className="font-bold text-indigo-900 block mb-2">解析</span>
+                                        {q.explanation}
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
+                                {(q.snippet || q.page) && (
+                                  <div className="mt-4 ml-12 space-y-3">
+                                    <button
+                                      onClick={() => setExpandedSnippet(expandedSnippet === q.id ? null : q.id)}
+                                      className="text-sm font-semibold text-indigo-600 flex items-center gap-1 hover:underline"
+                                    >
+                                      {expandedSnippet === q.id ? '收起教材原文' : '查看教材原文'}
+                                    </button>
+                                    {expandedSnippet === q.id && (
+                                      <div className="p-4 bg-white border border-indigo-100 rounded-2xl text-sm text-slate-700 shadow-sm">
+                                        <div className="font-bold text-slate-900 mb-1">{formatSource(q)}</div>
+                                        {q.page && <div className="text-xs text-slate-500 mb-2">页码：{q.page}</div>}
+                                        {q.snippet && <p className="whitespace-pre-line leading-relaxed">{q.snippet}</p>}
+                                      </div>
+                                    )}
                                   </div>
                                 )}
                             </div>
@@ -394,7 +533,7 @@ const QuizView: React.FC<QuizViewProps> = ({ onFinish, materials, refreshMateria
                       answers: {},
                     }));
                   }}
-                  className="px-8 py-4 bg-slate-900 text-white font-bold rounded-2xl hover:bg-slate-800 hover:shadow-lg hover:-translate-y-1 transition-all flex items-center gap-2"
+                  className="px-8 py-4 bg-gradient-to-r from-indigo-500 to-violet-600 text-white font-bold rounded-2xl hover:shadow-lg hover:shadow-indigo-200 hover:-translate-y-1 transition-all flex items-center gap-2"
                 >
                     <RefreshCcw size={18} /> 开始新的练习
                 </button>

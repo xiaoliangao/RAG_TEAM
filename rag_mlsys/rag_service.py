@@ -4,7 +4,7 @@ import torch
 import os
 import hashlib
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
@@ -61,12 +61,29 @@ class EnsembleRetriever:
             return res["documents"]
         return res
     
-    def retrieve(self, query: str) -> List[Document]:
+    def retrieve(
+        self,
+        query: str,
+        filters: Optional[Dict[str, Any]] = None,
+        k: Optional[int] = None,
+    ) -> List[Document]:
         docs: List[Document] = []
 
-        docs.extend(self._call_retriever(self.vector_retriever, query))
+        top_k = k or self.k
+        if filters:
+            vectorstore = getattr(self.vector_retriever, "vectorstore", None)
+            if vectorstore is not None:
+                docs.extend(
+                    vectorstore.similarity_search(
+                        query, k=top_k, filter=filters
+                    )
+                )
+            else:
+                docs.extend(self._call_retriever(self.vector_retriever, query))
+        else:
+            docs.extend(self._call_retriever(self.vector_retriever, query))
 
-        if self.bm25_retriever:
+        if self.bm25_retriever and not filters:
             docs.extend(self._call_retriever(self.bm25_retriever, query))
 
         unique: Dict[str, Document] = {}
@@ -190,14 +207,18 @@ class RAGService:
         self.retriever = EnsembleRetriever(self.db, k=k)
 
     def retrieve_with_enhancements(
-        self, query: str, k: int = 4, enable_expansion: bool = True
+        self,
+        query: str,
+        k: int = 4,
+        enable_expansion: bool = True,
+        filters: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, List[str], List[Document]]:
         all_docs: List[Document] = []
         seen_content = set()
 
         queries = generate_queries(query, num_queries=2) if enable_expansion else [query]
         for q in queries:
-            docs = self.retriever.retrieve(q)
+            docs = self.retriever.retrieve(q, filters=filters, k=k)
             for doc in docs:
                 content_hash = hashlib.md5(doc.page_content.encode()).hexdigest()
                 if content_hash not in seen_content:
@@ -227,9 +248,10 @@ class RAGService:
         enable_expansion: bool = True,
         use_fewshot: bool = True,
         use_multi_turn: bool = True,
+        filters: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, List[str]]:
         context, sources, docs = self.retrieve_with_enhancements(
-            question, k=k, enable_expansion=enable_expansion
+            question, k=k, enable_expansion=enable_expansion, filters=filters
         )
 
         dialogue_history = None

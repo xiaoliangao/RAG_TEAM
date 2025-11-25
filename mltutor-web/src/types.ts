@@ -8,11 +8,20 @@ export interface AppSettings {
   temperature: number;
 }
 
+export interface Chapter {
+  id: string;
+  title: string;
+  material_id: string;
+  page_start?: number | null;
+  page_end?: number | null;
+}
+
 export interface AppState {
   isKnowledgeBaseReady: boolean;
   isProcessing: boolean;
   activeTab: TabId;
   settings: AppSettings;
+  selectedMaterialId: string | null;
 }
 
 export interface Message {
@@ -37,6 +46,8 @@ export interface ChatRequest {
   use_fewshot?: boolean;
   use_multi_turn?: boolean;
   history?: ChatHistoryItem[];
+  material_id?: string | null;
+  chapter_id?: string | null;
 }
 
 export interface ChatResponse {
@@ -70,6 +81,7 @@ export interface QuizGenerateRequest {
   num_boolean: number;
   difficulty: QuizDifficulty;
   material_id?: string | null;
+  chapter_id?: string | null;
 }
 
 export interface QuizQuestion {
@@ -81,6 +93,34 @@ export interface QuizQuestion {
   explanation?: string;
   qtype?: 'choice' | 'boolean' | string;
   type?: 'choice' | 'boolean' | string;
+  source?: string | null;
+  page?: number | null;
+  chapter_id?: string | null;
+  chapter_title?: string | null;
+  snippet?: string | null;
+  material_id?: string | null;
+  concept_key?: string | null;
+}
+
+export interface QuizSubmitQuestionPayload extends QuizQuestion {
+  user_answer?: string | null;
+}
+
+export interface QuizSubmitRequestPayload {
+  difficulty: QuizDifficulty;
+  questions: QuizSubmitQuestionPayload[];
+  material_id?: string | null;
+  chapter_id?: string | null;
+  num_choice?: number;
+  num_boolean?: number;
+  mode?: 'standard' | 'review';
+}
+
+export interface QuizSubmitResponsePayload {
+  score_raw: number;
+  score_total: number;
+  score_percentage: number;
+  next_chapter?: Chapter | null;
 }
 
 export interface QuizGenerateResponse {
@@ -92,12 +132,18 @@ export interface QuizResult {
   correct: number;
   wrong: number;
   scorePercentage: number;
+  nextChapter?: Chapter | null;
   results: {
     questionId: number;
     isCorrect: boolean;
     userAnswer: string | null;
     correctAnswer?: string;
     questionText?: string;
+    source?: string | null;
+    page?: number | null;
+    chapter_id?: string | null;
+    chapter_title?: string | null;
+    snippet?: string | null;
   }[];
 }
 
@@ -110,7 +156,7 @@ export interface QuizSessionState {
     boolean: number;
     difficulty: QuizDifficulty;
   };
-  selectedMaterial: string;
+  mode: 'standard' | 'review';
   result: QuizResult | null;
 }
 
@@ -131,4 +177,17 @@ export interface StudyOverview {
 export interface StudyReportOverview {
   overview: StudyOverview;
   focus_topics: string[];
+}
+
+export interface WrongQuestion extends QuizQuestion {
+  id: number;
+}
+
+export interface StudyDiagnosticResponse {
+  markdown: string;
+}
+
+export interface ScorePoint {
+  ts?: string | null;
+  score: number;
 }

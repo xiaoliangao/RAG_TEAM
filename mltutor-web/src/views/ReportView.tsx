@@ -1,13 +1,22 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } from 'recharts';
-import { Download, ArrowRight, BrainCircuit, Target, TrendingUp, Check, X, RefreshCw } from 'lucide-react';
-import { fetchReportOverview, chat } from '../api/client';
-import type { QuizHistoryEntry, QuizResult, StudyReportOverview, ChatRequest } from '../types';
+import { Download, ArrowRight, BrainCircuit, Target, TrendingUp, Check, X, RefreshCw, Sparkles } from 'lucide-react';
+import { fetchReportOverview, chat, fetchStudyDiagnostic, fetchScoreTimeline } from '../api/client';
+import type {
+  Material,
+  QuizHistoryEntry,
+  QuizResult,
+  StudyReportOverview,
+  ChatRequest,
+  StudyDiagnosticResponse,
+  ScorePoint,
+} from '../types';
 
 interface ReportViewProps {
   lastResult: QuizResult | null;
   onAskAI: (question: string) => void;
   history: QuizHistoryEntry[];
+  currentMaterial?: Material | null;
 }
 
 const extractTopic = (input?: string | null) => {
@@ -23,7 +32,7 @@ const extractTopic = (input?: string | null) => {
   return cleaned.slice(0, 16);
 };
 
-const ReportView: React.FC<ReportViewProps> = ({ lastResult, onAskAI, history }) => {
+const ReportView: React.FC<ReportViewProps> = ({ lastResult, onAskAI, history, currentMaterial }) => {
   const [report, setReport] = useState<StudyReportOverview | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -32,6 +41,33 @@ const ReportView: React.FC<ReportViewProps> = ({ lastResult, onAskAI, history })
   const [analysisLoading, setAnalysisLoading] = useState(false);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const [diagnostic, setDiagnostic] = useState<string>('');
+  const [diagnosticLoading, setDiagnosticLoading] = useState(false);
+  const [diagnosticError, setDiagnosticError] = useState<string | null>(null);
+  const [timelinePoints, setTimelinePoints] = useState<ScorePoint[]>([]);
+  const [timelineError, setTimelineError] = useState<string | null>(null);
+  const [timelineLoading, setTimelineLoading] = useState(false);
+  const markdownReady = useRef(false);
+  const renderMarkdown = useCallback((text: string) => {
+    if (!text) return '';
+    if (typeof window === 'undefined') {
+      return text.replace(/\n/g, '<br/>');
+    }
+    const markedLib = (window as typeof window & { marked?: { parse: (input: string) => string; setOptions?: (opts: Record<string, unknown>) => void } }).marked;
+    if (!markedLib) {
+      return text.replace(/\n/g, '<br/>');
+    }
+    if (!markdownReady.current && typeof markedLib.setOptions === 'function') {
+      markedLib.setOptions({
+        breaks: true,
+        gfm: true,
+        headerIds: false,
+        mangle: false,
+      });
+      markdownReady.current = true;
+    }
+    return markedLib.parse(text);
+  }, []);
 
   const loadOverview = useCallback(async () => {
     setLoading(true);
@@ -47,15 +83,46 @@ const ReportView: React.FC<ReportViewProps> = ({ lastResult, onAskAI, history })
     }
   }, []);
 
+  const loadTimeline = useCallback(async () => {
+    setTimelineLoading(true);
+    setTimelineError(null);
+    try {
+      const data = await fetchScoreTimeline();
+      setTimelinePoints(data);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '趋势数据加载失败';
+      setTimelineError(message);
+    } finally {
+      setTimelineLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     void loadOverview();
-  }, [loadOverview]);
+    void loadTimeline();
+  }, [loadOverview, loadTimeline]);
 
   useEffect(() => {
     if (lastResult) {
       void loadOverview();
+      void loadTimeline();
     }
-  }, [lastResult, loadOverview]);
+  }, [lastResult, loadOverview, loadTimeline]);
+  const handleGenerateDiagnostic = async () => {
+    setDiagnosticLoading(true);
+    setDiagnosticError(null);
+    try {
+      const data: StudyDiagnosticResponse = await fetchStudyDiagnostic({
+        material_id: currentMaterial?.id ?? undefined,
+      });
+      setDiagnostic(data.markdown);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '诊断报告生成失败';
+      setDiagnosticError(message);
+    } finally {
+      setDiagnosticLoading(false);
+    }
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -74,7 +141,7 @@ const ReportView: React.FC<ReportViewProps> = ({ lastResult, onAskAI, history })
             return `题目${idx + 1}（${tag}）: ${res.questionText ?? ''}`;
           })
           .join('\n');
-        const prompt = `你是学习报告分析助手。请根据以下题目表现，列出 2-4 个需要强化的章节或核心知识点。只返回 JSON，格式如 {"topics":["知识点1","知识点2"]}，不写其他内容。\n\n题目信息：\n${questionSummary}`;
+        const prompt = `你是学习报告分析助手。请根据以下题目表现，列出 2-4 个需要强化的核心知识点。只返回 JSON，格式如 {"topics":["知识点1","知识点2"]}，不写其他内容。\n\n题目信息：\n${questionSummary}`;
 
         const request: ChatRequest = {
           question: prompt,
@@ -200,13 +267,32 @@ const ReportView: React.FC<ReportViewProps> = ({ lastResult, onAskAI, history })
         ? derivedTopics
         : (focusTopics.length ? focusTopics : fallbackTopics));
 
+  const masteryScore = Math.min(
+    100,
+    Math.max(
+      0,
+      displayStats?.average_score ?? lastResult?.scorePercentage ?? 72,
+    ),
+  );
+
   const mergedHistory = useMemo(() => {
+    const useLocalHistory = !timelinePoints.length
+      || (timelinePoints.every((entry) => !entry.score) && history.length > 0);
+
+    if (!useLocalHistory && timelinePoints.length) {
+      return timelinePoints.map((entry, idx) => ({
+        date: entry.ts ? new Date(entry.ts).toLocaleString('zh-CN', { month: 'short', day: 'numeric' }) : `记录${idx + 1}`,
+        score: entry.score,
+      }));
+    }
+
     if (history.length) {
       return history.map((entry) => ({
         date: entry.label,
         score: entry.score,
       }));
     }
+
     if (overview) {
       return [
         { date: '平均成绩', score: overview.average_score },
@@ -215,7 +301,7 @@ const ReportView: React.FC<ReportViewProps> = ({ lastResult, onAskAI, history })
       ];
     }
     return [];
-  }, [history, overview]);
+  }, [timelinePoints, history, overview]);
 
   const feedbackParagraphs = useMemo(() => {
     if (!displayStats) return [];
@@ -258,25 +344,42 @@ const ReportView: React.FC<ReportViewProps> = ({ lastResult, onAskAI, history })
              </div>
              <div className="p-2 bg-indigo-50 text-indigo-600 rounded-xl"><Target size={20}/></div>
           </div>
-          {analysisLoading && (
-            <div className="text-xs text-slate-400 mb-4">正在分析知识点...</div>
-          )}
-          {analysisError && (
-            <div className="text-xs text-red-500 mb-4">{analysisError}</div>
-          )}
-          {displayTopics.length ? (
-            <div className="flex flex-wrap gap-3">
-              {displayTopics.map((topic) => (
-                <span key={topic} className="px-3 py-1.5 rounded-full bg-indigo-50 text-indigo-700 text-sm font-semibold border border-indigo-100">
-                  {topic}
-                </span>
-              ))}
+          <div className="grid grid-cols-1 md:grid-cols-[auto,1fr] gap-6 items-center">
+            <div className="flex flex-col items-center justify-center">
+              <div
+                className="relative w-32 h-32 rounded-full flex items-center justify-center"
+                style={{ background: `conic-gradient(#7c3aed ${masteryScore}%, #e2e8f0 0)` }}
+              >
+                <div className="absolute inset-2 rounded-full bg-white shadow-inner shadow-slate-200" />
+                <div className="relative z-10 text-center">
+                  <div className="text-xs text-slate-500 font-semibold mb-1">平均掌握</div>
+                  <div className="text-2xl font-bold text-indigo-700 leading-none">{masteryScore.toFixed(0)}%</div>
+                </div>
+              </div>
+              <p className="text-xs text-slate-400 mt-2">基于近期测验均分估算</p>
             </div>
-          ) : (
-            <div className="h-48 flex items-center justify-center text-slate-400 text-sm border border-dashed border-slate-200 rounded-2xl">
-              暂无重点知识点数据
+            <div>
+              {analysisLoading && (
+                <div className="text-xs text-slate-400 mb-4">正在分析知识点...</div>
+              )}
+              {analysisError && (
+                <div className="text-xs text-red-500 mb-4">{analysisError}</div>
+              )}
+              {displayTopics.length ? (
+                <div className="flex flex-wrap gap-3">
+                  {displayTopics.map((topic) => (
+                    <span key={topic} className="px-3 py-1.5 rounded-full bg-indigo-50 text-indigo-700 text-sm font-semibold border border-indigo-100 hover:-translate-y-0.5 hover:shadow-sm transition-transform">
+                      {topic}
+                    </span>
+                  ))}
+                </div>
+              ) : (
+                <div className="h-48 flex items-center justify-center text-slate-400 text-sm border border-dashed border-slate-200 rounded-2xl">
+                  暂无重点知识点数据
+                </div>
+              )}
             </div>
-          )}
+          </div>
         </div>
 
         <div className="bg-white p-8 rounded-[2rem] border border-slate-200 shadow-sm hover:shadow-md transition-shadow">
@@ -287,6 +390,8 @@ const ReportView: React.FC<ReportViewProps> = ({ lastResult, onAskAI, history })
              </div>
              <div className="p-2 bg-emerald-50 text-emerald-600 rounded-xl"><TrendingUp size={20}/></div>
           </div>
+          {timelineLoading && <p className="text-xs text-slate-400 mb-2">趋势数据加载中...</p>}
+          {timelineError && <p className="text-xs text-red-500 mb-2">{timelineError}</p>}
           <div className="h-72 w-full">
             {mergedHistory.length ? (
               <ResponsiveContainer width="100%" height="100%">
@@ -297,11 +402,23 @@ const ReportView: React.FC<ReportViewProps> = ({ lastResult, onAskAI, history })
                       <stop offset="95%" stopColor="#10B981" stopOpacity={0}/>
                     </linearGradient>
                   </defs>
-                  <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#F1F5F9" />
+                  <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#E2E8F0" />
                   <XAxis dataKey="date" axisLine={false} tickLine={false} tick={{fill: '#64748B', fontSize: 12, fontWeight: 500}} dy={10} />
                   <YAxis domain={[0, 100]} axisLine={false} tickLine={false} tick={{fill: '#64748B', fontSize: 12}} />
-                  <Tooltip contentStyle={{borderRadius: '12px', border: 'none', boxShadow: '0 10px 15px -3px rgba(0,0,0,0.1)', padding: '12px'}} />
-                  <Area type="monotone" dataKey="score" stroke="#10B981" strokeWidth={3} fillOpacity={1} fill="url(#colorScore)" />
+                  <Tooltip
+                    contentStyle={{borderRadius: '12px', border: '1px solid #E2E8F0', boxShadow: '0 20px 45px -25px rgba(0,0,0,0.35)', padding: '12px', background: '#fff'}}
+                    formatter={(value: number) => [`${value.toFixed(1)} 分`, '得分']}
+                  />
+                  <Area
+                    type="monotone"
+                    dataKey="score"
+                    stroke="#10B981"
+                    strokeWidth={3}
+                    fillOpacity={1}
+                    fill="url(#colorScore)"
+                    dot={{ r: 4, fill: '#10B981', stroke: '#fff', strokeWidth: 2 }}
+                    activeDot={{ r: 6, fill: '#059669', stroke: '#ecfdf3', strokeWidth: 2 }}
+                  />
                 </AreaChart>
               </ResponsiveContainer>
             ) : (
@@ -329,7 +446,8 @@ const ReportView: React.FC<ReportViewProps> = ({ lastResult, onAskAI, history })
       </div>
 
       <div className="bg-white rounded-[2.5rem] border border-slate-200 shadow-xl shadow-slate-200/50 overflow-hidden">
-        <div className="bg-slate-900 p-8 text-white flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+        <div className="bg-gradient-to-br from-[#0f172a] via-[#111827] to-[#1f2937] p-8 text-white flex flex-col md:flex-row justify-between items-start md:items-center gap-4 ring-1 ring-indigo-500/10 shadow-[0_25px_70px_-40px_rgba(79,70,229,0.6)] relative overflow-hidden">
+            <div className="absolute -right-10 -top-10 w-56 h-56 bg-indigo-500/15 rounded-full blur-3xl pointer-events-none" />
             <div>
                 <div className="inline-flex items-center gap-2 bg-white/10 backdrop-blur-sm px-3 py-1 rounded-full text-xs font-bold text-indigo-200 mb-3 border border-white/10">
                     <BrainCircuit size={14}/> AI 导师
@@ -338,6 +456,13 @@ const ReportView: React.FC<ReportViewProps> = ({ lastResult, onAskAI, history })
                 <p className="text-slate-400 mt-1">基于测验结果的深度分析</p>
             </div>
             <div className="flex gap-2">
+              <button
+                onClick={handleGenerateDiagnostic}
+                className="bg-white/10 border border-white/20 text-white hover:bg-white/20 px-4 py-2.5 rounded-xl text-sm font-bold transition-colors flex items-center gap-2"
+                disabled={diagnosticLoading}
+              >
+                <Sparkles size={16} className={diagnosticLoading ? 'animate-spin' : ''} /> {diagnosticLoading ? '生成中...' : '生成诊断'}
+              </button>
               <button
                 onClick={() => loadOverview()}
                 className="bg-white/10 border border-white/20 text-white hover:bg-white/20 px-4 py-2.5 rounded-xl text-sm font-bold transition-colors flex items-center gap-2"
@@ -355,14 +480,23 @@ const ReportView: React.FC<ReportViewProps> = ({ lastResult, onAskAI, history })
             </div>
         </div>
         
-        <div className="p-10">
-            <div className="prose prose-slate max-w-none prose-headings:font-bold prose-headings:text-slate-900 prose-p:text-slate-600 prose-p:leading-relaxed">
-                {feedbackParagraphs.length ? (
-                  feedbackParagraphs.map((paragraph, idx) => (
-                    <p key={idx} className="mb-3">{paragraph}</p>
-                  ))
+            <div className="p-10">
+                <div className="prose prose-slate max-w-none prose-headings:font-bold prose-headings:text-slate-900 prose-p:text-slate-600 prose-p:leading-relaxed">
+                    {feedbackParagraphs.length ? (
+                      feedbackParagraphs.map((paragraph, idx) => (
+                        <p key={idx} className="mb-3">{paragraph}</p>
+                      ))
                 ) : (
                   <p className="text-slate-500">暂无测验记录，完成一次练习后即可生成详细诊断报告。</p>
+                )}
+                {diagnosticError && (
+                  <p className="text-sm text-red-500 mt-4">{diagnosticError}</p>
+                )}
+                {diagnostic && (
+                  <div
+                    className="mt-6 bg-slate-50/70 border border-slate-100 rounded-2xl p-4 text-sm text-slate-700 markdown-body"
+                    dangerouslySetInnerHTML={{ __html: renderMarkdown(diagnostic) }}
+                  />
                 )}
             </div>
         </div>
@@ -377,8 +511,8 @@ const ReportView: React.FC<ReportViewProps> = ({ lastResult, onAskAI, history })
                         className="flex items-center justify-between p-5 bg-white border border-indigo-100 rounded-2xl hover:border-indigo-500 hover:shadow-lg hover:shadow-indigo-200/50 hover:-translate-y-1 transition-all group text-left"
                     >
                         <span className="font-bold text-slate-700 group-hover:text-indigo-700">{q}</span>
-                        <div className="w-8 h-8 bg-indigo-50 rounded-full flex items-center justify-center group-hover:bg-indigo-600 transition-colors">
-                             <ArrowRight size={16} className="text-indigo-600 group-hover:text-white transition-colors" />
+                        <div className="w-8 h-8 bg-indigo-50 rounded-full flex items-center justify-center group-hover:bg-indigo-600 transition-all">
+                             <ArrowRight size={16} className="text-indigo-600 group-hover:text-white transition-all group-hover:translate-x-0.5" />
                         </div>
                     </button>
                 ))}

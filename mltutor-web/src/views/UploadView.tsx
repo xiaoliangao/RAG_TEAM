@@ -1,6 +1,7 @@
-import React, { useState, useEffect } from 'react';
-import { UploadCloud, CheckCircle2, Database, Loader2, BookOpen, Zap, ArrowRight, FileCheck, Sparkles } from 'lucide-react';
-import type { UploadResponse } from '../types';
+import React, { useState, useEffect, useMemo } from 'react';
+import { UploadCloud, Loader2, CheckCircle2 } from 'lucide-react';
+import ZenNeuralJellyfish from '../components/ZenNeuralJellyfish';
+import type { UploadResponse, MaterialsResponse, Material } from '../types';
 
 interface UploadViewProps {
   isProcessing: boolean;
@@ -8,34 +9,23 @@ interface UploadViewProps {
   onLoadDefault: () => void;
   kbReady: boolean;
   errorMessage?: string | null;
+  materials?: MaterialsResponse | null;
+  selectedMaterialId?: string | null;
+  onSelectMaterial?: (id: string | null) => void;
+  currentMaterial?: Material | null;
 }
 
-const StepItem = ({ 
-  title, 
-  status, 
-  index
-}: { 
-  title: string; 
-  status: 'pending' | 'active' | 'completed';
-  index: number;
+const UploadView: React.FC<UploadViewProps> = ({
+  isProcessing,
+  onUpload,
+  onLoadDefault,
+  kbReady,
+  errorMessage,
+  materials,
+  selectedMaterialId,
+  onSelectMaterial,
+  currentMaterial,
 }) => {
-  const styles = {
-    pending: "bg-slate-100 text-slate-400 border-slate-200",
-    active: "bg-indigo-600 text-white border-indigo-600 shadow-lg shadow-indigo-200",
-    completed: "bg-emerald-500 text-white border-emerald-500"
-  };
-
-  return (
-    <div className="flex flex-col items-center relative z-10">
-      <div className={`w-10 h-10 rounded-full border-2 flex items-center justify-center text-sm font-bold transition-all duration-500 ${styles[status]}`}>
-        {status === 'completed' ? <CheckCircle2 size={18} /> : (status === 'active' ? <Loader2 size={18} className="animate-spin" /> : index)}
-      </div>
-      <span className={`text-xs font-bold mt-2 uppercase tracking-wide ${status === 'pending' ? 'text-slate-400' : 'text-slate-800'}`}>{title}</span>
-    </div>
-  );
-};
-
-const UploadView: React.FC<UploadViewProps> = ({ isProcessing, onUpload, onLoadDefault, kbReady, errorMessage }) => {
   const [dragActive, setDragActive] = useState(false);
   const [progress, setProgress] = useState(0);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
@@ -44,15 +34,11 @@ const UploadView: React.FC<UploadViewProps> = ({ isProcessing, onUpload, onLoadD
   useEffect(() => {
     if (isProcessing) {
       const interval = setInterval(() => {
-        setProgress((prev) => {
-          if (prev >= 95) return prev;
-          return prev + 5;
-        });
+        setProgress((prev) => (prev >= 95 ? prev : prev + 5));
       }, 200);
       return () => clearInterval(interval);
-    } else {
-      setProgress(0);
     }
+    setProgress(0);
   }, [isProcessing]);
 
   useEffect(() => {
@@ -61,12 +47,25 @@ const UploadView: React.FC<UploadViewProps> = ({ isProcessing, onUpload, onLoadD
     }
   }, [errorMessage]);
 
+  const uploadedMaterials = materials?.uploaded ?? [];
+  const builtinMaterials = materials?.builtins ?? [];
+  const libraryMaterials = useMemo(() => {
+    const merged: Material[] = [];
+    const seen = new Set<string>();
+    [...uploadedMaterials, ...builtinMaterials].forEach((item) => {
+      if (seen.has(item.id)) return;
+      seen.add(item.id);
+      merged.push(item);
+    });
+    return merged;
+  }, [uploadedMaterials, builtinMaterials]);
+
   const handleDrag = (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    if (e.type === "dragenter" || e.type === "dragover") {
+    if (e.type === 'dragenter' || e.type === 'dragover') {
       setDragActive(true);
-    } else if (e.type === "dragleave") {
+    } else if (e.type === 'dragleave') {
       setDragActive(false);
     }
   };
@@ -90,130 +89,110 @@ const UploadView: React.FC<UploadViewProps> = ({ isProcessing, onUpload, onLoadD
     }
   };
 
-  // Logic for pipeline visualization
-  const step1Status = isProcessing ? 'completed' : (kbReady ? 'completed' : 'active'); // Upload
-  const step2Status = isProcessing ? 'active' : (kbReady ? 'completed' : 'pending'); // Indexing
-  const step3Status = kbReady ? 'completed' : 'pending'; // Ready
+  const renderUploadBanner = () => (
+    <div className="rounded-3xl border border-dashed border-white/70 bg-white/70 backdrop-blur-xl p-6 shadow-[0_18px_48px_-32px_rgba(15,23,42,0.35)] relative overflow-hidden min-h-[320px]">
+      <div className="absolute inset-0 pointer-events-none bg-[radial-gradient(circle_at_20%_20%,rgba(129,140,248,0.12),transparent_45%),radial-gradient(circle_at_80%_0,rgba(147,197,253,0.1),transparent_35%)]" />
+      <p className="text-xs uppercase tracking-widest text-slate-400 font-bold mb-2">操作区 · 上传教材</p>
+      {isProcessing ? (
+        <div className="space-y-4">
+          <div className="flex items-center gap-3">
+            <div className="w-12 h-12 rounded-2xl bg-indigo-50 text-indigo-600 flex items-center justify-center shadow-inner shadow-indigo-100">
+              <Loader2 className="animate-spin" size={24} />
+            </div>
+            <div>
+              <p className="text-base font-bold text-slate-900">正在解析文档</p>
+              <p className="text-sm text-slate-500">上传 → 索引 → 即将就绪</p>
+            </div>
+          </div>
+          <div className="w-full h-2 rounded-full bg-slate-100 overflow-hidden">
+            <div className="h-full bg-indigo-500 transition-all" style={{ width: `${progress}%` }} />
+          </div>
+          <div className="grid grid-cols-3 gap-2 text-xs">
+            {['上传文件', '构建索引', '准备学习'].map((label, idx) => (
+              <div
+                key={label}
+                className={`rounded-xl px-3 py-2 flex items-center justify-between border ${
+                  progress >= (idx + 1) * 30
+                    ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                    : 'border-slate-200 bg-slate-50 text-slate-500'
+                }`}
+              >
+                <span>{label}</span>
+                {progress >= (idx + 1) * 30 ? <CheckCircle2 size={14} /> : <span>{idx + 1}</span>}
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : (
+        <div
+          onDragEnter={handleDrag}
+          onDragLeave={handleDrag}
+          onDragOver={handleDrag}
+          onDrop={handleDrop}
+          className={`relative border-2 border-dashed rounded-2xl p-8 text-center transition-all duration-300 cursor-pointer group ${
+            dragActive ? 'border-indigo-500 bg-indigo-50/60' : 'border-slate-200 hover:border-indigo-300 hover:bg-slate-50/60'
+          }`}
+        >
+          <input
+            type="file"
+            className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-20"
+            onChange={(e) => e.target.files && void triggerUpload(e.target.files[0])}
+            accept=".pdf"
+          />
+          <div className="relative z-10 pointer-events-none space-y-4">
+            <div className="w-20 h-20 mx-auto rounded-3xl bg-white/80 border border-indigo-100 shadow-lg shadow-indigo-100 flex items-center justify-center">
+              <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-indigo-500 to-indigo-700 flex items-center justify-center text-white shadow-inner shadow-indigo-300">
+                <UploadCloud size={30} />
+              </div>
+            </div>
+            <h4 className="text-lg font-bold text-slate-900">拖拽 PDF 到此处，或点击选择文件</h4>
+            <p className="text-sm text-slate-500">支持 PDF，单文件 50MB 内，自动切片并构建索引</p>
+          </div>
+        </div>
+      )}
+      {(localError || successMessage) && (
+        <div className={`mt-4 text-sm font-medium px-4 py-3 rounded-xl border ${localError ? 'text-rose-700 bg-rose-100 border-rose-200' : 'text-emerald-700 bg-emerald-100 border-emerald-200'}`}>
+          {localError || successMessage}
+        </div>
+      )}
+    </div>
+  );
+
+  const renderContextCard = () => (
+    <div className="glass-panel rounded-3xl p-6 space-y-4 min-h-[320px]">
+      <div className="flex items-center justify-between">
+        <div>
+          <p className="text-xs uppercase tracking-widest text-slate-400 font-bold">学习上下文</p>
+          <h4 className="text-lg font-bold text-slate-900">当前教材</h4>
+        </div>
+        <span className={`w-2.5 h-2.5 rounded-full ${kbReady ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]' : 'bg-slate-300'}`} />
+      </div>
+      <p className="text-xs text-slate-500">
+        从资料库中选择一份教材，AI 助教将以它为基础生成测验与回答。
+      </p>
+      <select
+        value={selectedMaterialId ?? ''}
+        onChange={(e) => onSelectMaterial?.(e.target.value || null)}
+        className="w-full rounded-xl border border-white/70 bg-white/80 px-4 py-2.5 text-sm font-semibold text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-200 shadow-sm"
+      >
+        <option value="">未选择教材</option>
+        {libraryMaterials.map((mat) => (
+          <option key={mat.id} value={mat.id}>
+            {mat.name}
+          </option>
+        ))}
+      </select>
+      <p className="text-[11px] text-slate-400">可切换为自定义上传或系统推荐的内置教材。</p>
+    </div>
+  );
 
   return (
     <div className="space-y-8">
-      {/* Feature Highlights */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        {[
-          { icon: Database, title: "双模知识库", desc: "向量 + 关键词混合检索，精准定位" },
-          { icon: Zap, title: "智能测验流", desc: "自适应难度，支持选择与判断题" },
-          { icon: BookOpen, title: "AI 深度诊断", desc: "分析错题模式，生成个性化建议" },
-        ].map((item, idx) => (
-          <div key={idx} className="bg-white p-5 rounded-2xl border border-slate-100 shadow-[0_2px_8px_rgba(0,0,0,0.04)] hover:shadow-md transition-all group">
-            <div className="w-10 h-10 bg-indigo-50 text-indigo-600 rounded-xl flex items-center justify-center mb-3 group-hover:scale-110 transition-transform">
-              <item.icon size={20} />
-            </div>
-            <h3 className="font-bold text-slate-900">{item.title}</h3>
-            <p className="text-sm text-slate-500 mt-1">{item.desc}</p>
-          </div>
-        ))}
-      </div>
+      <ZenNeuralJellyfish />
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-        {/* Left: Upload Area */}
-        <div className="lg:col-span-2 space-y-6">
-          <div className="flex items-center justify-between">
-            <div>
-              <h3 className="text-xl font-bold text-slate-900">上传新的教材</h3>
-              <p className="text-slate-500 text-sm">支持 PDF 格式，文件大小限制 50MB。</p>
-            </div>
-          </div>
-
-          {isProcessing ? (
-            <div className="bg-white border border-indigo-100 rounded-[2rem] p-12 text-center shadow-lg shadow-indigo-100/50 relative overflow-hidden">
-              <div className="absolute inset-0 bg-indigo-50/50"></div>
-              <div className="absolute bottom-0 left-0 h-1.5 bg-indigo-600 transition-all duration-300 ease-out" style={{ width: `${progress}%` }}></div>
-              <div className="relative z-10 flex flex-col items-center">
-                <div className="w-16 h-16 bg-white rounded-full shadow-md flex items-center justify-center mb-6">
-                  <Loader2 className="animate-spin text-indigo-600" size={32} strokeWidth={2.5} />
-                </div>
-                <h4 className="text-xl font-bold text-indigo-950">正在解析文档</h4>
-                <p className="text-indigo-600/80 font-medium mt-2">提取文本并构建向量索引 ({progress}%)</p>
-              </div>
-            </div>
-          ) : (
-            <div 
-              onDragEnter={handleDrag}
-              onDragLeave={handleDrag}
-              onDragOver={handleDrag}
-              onDrop={handleDrop}
-              className={`relative border-2 border-dashed rounded-[2rem] p-12 text-center transition-all duration-300 cursor-pointer group
-                ${dragActive ? 'border-indigo-500 bg-indigo-50/50 scale-[1.01]' : 'border-slate-300 hover:border-indigo-400 hover:bg-slate-50/50 bg-white'}`}
-            >
-              <input 
-                type="file" 
-                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-20" 
-                onChange={(e) => e.target.files && void triggerUpload(e.target.files[0])}
-                accept=".pdf"
-              />
-              <div className="relative z-10 pointer-events-none">
-                <div className="w-20 h-20 bg-indigo-50 text-indigo-600 rounded-3xl flex items-center justify-center mx-auto mb-6 group-hover:scale-110 group-hover:rotate-3 transition-transform shadow-sm">
-                  <UploadCloud size={40} strokeWidth={1.5} />
-                </div>
-                <h4 className="text-lg font-bold text-slate-900">将 PDF 拖放到此处</h4>
-                <p className="text-slate-500 mt-2 mb-6">或点击选择文件</p>
-                <button className="px-5 py-2.5 bg-white border border-slate-200 text-slate-700 font-bold text-sm rounded-xl shadow-sm group-hover:border-indigo-200 group-hover:text-indigo-700 transition-colors">
-                  选择文件
-                </button>
-              </div>
-            </div>
-          )}
-
-          {/* Pipeline Visualization */}
-          <div className="bg-white rounded-2xl p-8 border border-slate-100 shadow-sm">
-            <div className="relative flex justify-between">
-              <div className="absolute top-5 left-0 w-full h-0.5 bg-slate-100 -z-0"></div>
-              <StepItem title="上传教材" status={step1Status} index={1} />
-              <StepItem title="构建索引" status={step2Status} index={2} />
-              <StepItem title="开始学习" status={step3Status} index={3} />
-            </div>
-            {(localError || successMessage) && (
-              <div className={`mt-6 text-sm font-medium px-4 py-3 rounded-xl border ${localError ? 'text-red-600 bg-red-50 border-red-100' : 'text-emerald-700 bg-emerald-50 border-emerald-100'}`}>
-                {localError || successMessage}
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* Right: Quick Start */}
-        <div className="space-y-6">
-          <div className="bg-white p-6 rounded-[1.5rem] border border-slate-200/60 shadow-[0_4px_20px_rgba(0,0,0,0.03)]">
-            <h3 className="text-lg font-bold text-slate-900 mb-4 flex items-center gap-2">
-              <Sparkles size={18} className="text-amber-400" fill="currentColor" /> 快速开始
-            </h3>
-            
-            <div className="group p-5 bg-gradient-to-br from-slate-50 to-white rounded-2xl border border-slate-200 hover:border-indigo-200 transition-all cursor-pointer shadow-sm hover:shadow-md" onClick={!isProcessing ? onLoadDefault : undefined}>
-              <div className="flex items-start justify-between mb-3">
-                <div className="w-10 h-10 bg-white rounded-xl border border-slate-100 shadow-sm flex items-center justify-center text-indigo-600 group-hover:scale-110 transition-transform">
-                  <BookOpen size={20} />
-                </div>
-                <span className="bg-indigo-50 text-indigo-700 text-[10px] font-bold px-2 py-1 rounded-full uppercase tracking-wide">演示</span>
-              </div>
-              <h4 className="font-bold text-slate-900">机器学习基础</h4>
-              <p className="text-xs text-slate-500 mt-1 leading-relaxed">包含神经网络、反向传播及优化算法等核心理论。</p>
-              
-              <div className="mt-4 flex items-center text-indigo-600 text-sm font-bold group-hover:translate-x-1 transition-transform">
-                加载教材 <ArrowRight size={16} className="ml-1" />
-              </div>
-            </div>
-          </div>
-
-          {kbReady && (
-            <div className="bg-emerald-50/50 border border-emerald-100 p-6 rounded-[1.5rem]">
-               <div className="flex items-center gap-3 text-emerald-800 font-bold mb-2">
-                 <FileCheck size={20} /> 知识库已就绪
-               </div>
-               <p className="text-xs text-emerald-700/80 leading-relaxed">
-                 您的专属知识库已激活。现在可以开始生成测验或与 AI 助教对话了。
-               </p>
-            </div>
-          )}
-        </div>
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 items-stretch">
+        {renderContextCard()}
+        {renderUploadBanner()}
       </div>
     </div>
   );

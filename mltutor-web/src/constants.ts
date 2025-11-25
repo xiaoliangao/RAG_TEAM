@@ -13,6 +13,7 @@ export const INITIAL_APP_STATE: AppState = {
   settings: DEFAULT_SETTINGS,
   isKnowledgeBaseReady: false,
   isProcessing: false,
+  selectedMaterialId: null,
 };
 
 export const TABS: { id: TabId; label: string }[] = [

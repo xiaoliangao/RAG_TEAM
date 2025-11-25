@@ -6,6 +6,7 @@ import json
 import random
 import re
 from typing import Any, Dict, List, Optional
+from collections import defaultdict
 
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
@@ -77,6 +78,7 @@ def _build_question_gen_prompt(
     q_type: str,
     difficulty: str,
     target_truth: Optional[str] = None,  
+    avoid_question: Optional[str] = None,
 ) -> List[Dict[str, str]]:
     """构造给 LLM 的出题 Prompt（DeepSeek 使用 OpenAI 格式）"""
 
@@ -114,6 +116,12 @@ def _build_question_gen_prompt(
         else:
             truth_hint = ""
 
+    repeat_guard = (
+        f"\n- 这是针对同一知识点的重新出题，请确保题干与以往不同：避免复用之前的措辞。之前的错误题干示例：{avoid_question}"
+        if avoid_question
+        else ""
+    )
+
     system_prompt = f"""你是一位严苛的计算机科学考试出题专家。
 
 目标：基于给定的教材片段，{task_desc}（机器学习 / 深度学习 / 统计学习 相关）。
@@ -125,6 +133,7 @@ def _build_question_gen_prompt(
 4. 尽量考察「概念理解」「原理机制」「优缺点对比」「适用场景」等。
 5. 题干要清晰完整，语言简洁，避免多重否定。
 6. 若文本只包含版权信息、纯实验数据、公式堆砌、目录等，判定为不适合出题。
+7. 如果这是错题回顾，请给出与原题不同的全新表述，但考察同一概念。{repeat_guard}
 
 【难度要求】：
 - 如果 difficulty = "easy"：偏基础概念，题目直白。
@@ -201,6 +210,13 @@ def _parse_llm_json_output(raw_text: str) -> Optional[Dict[str, Any]]:
 
     if not isinstance(options, list) or len(options) < 2:
         return None
+    if qtype == "choice" and len(options) != 4:
+        return None
+    if qtype == "boolean" and len(options) != 2:
+        options = ["正确", "错误"]
+        idx = 0 if data.get("correct_answer_index") == 0 else 1
+        data["correct_answer_index"] = idx
+        data["options"] = options
 
     idx = data.get("correct_answer_index", None)
     if not isinstance(idx, int) or not (0 <= idx < len(options)):
@@ -245,15 +261,91 @@ def _validate_question_quality(question: Dict[str, Any]) -> (bool, str):
         if w in q_text:
             return False, f"包含禁止词汇 '{w}'"
 
+    context_cues = ["如上代码", "如下代码", "如上公式", "如下公式", "下列代码", "下列公式"]
+    no_context_tokens = ["=", "+", "-", "*", "/", "torch.", "np.", "公式", "代码", "def "]
+    if any(cue in q_text for cue in context_cues):
+        if not any(tok in q_text for tok in no_context_tokens):
+            return False, "题干缺乏必要的代码或公式上下文"
+
     if question["type"] == "choice":
         opts = question["options"]
         if not isinstance(opts, list) or len(opts) < 2:
             return False, "选项数量不足"
+        if len(opts) != 4:
+            return False, "必须是四选一"
         digit_opts = sum(1 for o in opts if re.match(r"^[\d\.\%]+$", str(o).strip()))
         if digit_opts >= 3:
             return False, "选项全是纯数字，疑似无意义数值题"
 
     return True, "OK"
+
+
+def regenerate_question_from_concept(
+    context: str,
+    metadata: Optional[Dict[str, Any]] = None,
+    difficulty: str = "medium",
+    q_type: str = "choice",
+    max_retries: int = 3,
+    avoid_question: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Generate a fresh question from a specific concept snippet, used for wrong-question redo.
+    """
+    if not context or not context.strip():
+        return None
+
+    normalized_type = q_type.lower() if isinstance(q_type, str) else "choice"
+    if normalized_type not in ("choice", "boolean"):
+        normalized_type = "choice"
+
+    attempts = 0
+    while attempts < max_retries:
+        attempts += 1
+        messages = _build_question_gen_prompt(
+            context,
+            normalized_type,
+            difficulty,
+            target_truth=None,
+            avoid_question=avoid_question,
+        )
+        try:
+            response = chat_completion(
+                messages=messages,
+                temperature=GENERATION_CONFIG.get("temperature", 0.2),
+                max_tokens=GENERATION_CONFIG.get("max_new_tokens", 1024),
+            )
+            parsed = _parse_llm_json_output(response)
+            if not parsed:
+                continue
+
+            is_valid, msg = _validate_question_quality(parsed)
+            if not is_valid:
+                print(f"Redo skipped (validation): {msg}")
+                continue
+
+            q = parsed.copy()
+            if q.get("type") == "choice":
+                opts = q.get("options", [])
+                idx = q.get("correct_answer_index", 0)
+                if isinstance(idx, int) and 0 <= idx < len(opts):
+                    correct_opt = opts[idx]
+                    random.shuffle(opts)
+                    q["options"] = opts
+                    q["correct_answer_index"] = opts.index(correct_opt)
+
+            meta = metadata or {}
+            q["source"] = meta.get("source") or meta.get("original_path")
+            q["page"] = meta.get("page")
+            q["chapter_id"] = meta.get("chapter_id")
+            q["chapter_title"] = meta.get("chapter_title")
+            q["material_id"] = meta.get("material_id")
+            q["snippet"] = context.strip()[:200]
+            return q
+        except Exception as e:
+            print(f"Redo generation error: {e}")
+            continue
+
+    return None
 
 
 
@@ -307,6 +399,21 @@ def generate_quiz_questions(
         return []
 
 
+    doc_usage: Dict[int, int] = defaultdict(int)
+
+    def _pick_doc() -> Document:
+        if not all_docs:
+            raise RuntimeError("知识库为空")
+        sample = random.sample(all_docs, min(len(all_docs), 8))
+        best_doc = None
+        best_score = float("inf")
+        for candidate in sample:
+            score = doc_usage[id(candidate)] + random.random() * 0.3
+            if score < best_score:
+                best_score = score
+                best_doc = candidate
+        return best_doc or random.choice(all_docs)
+
     def _generate_batch(
         target_count: int,
         q_type: str,
@@ -319,8 +426,9 @@ def generate_quiz_questions(
         while len(batch_questions) < target_count and attempts < max_total_attempts:
             attempts += 1
 
-            doc = random.choice(all_docs)
+            doc = _pick_doc()
             content = doc.page_content
+            doc_usage[id(doc)] += 1
 
             target_truth = None
             if q_type == "boolean" and truth_schedule:
@@ -367,6 +475,13 @@ def generate_quiz_questions(
                                 q["options"] = opts
                                 q["correct_answer_index"] = new_idx
 
+                        meta = getattr(doc, "metadata", {}) or {}
+                        q["source"] = meta.get("source") or meta.get("original_path")
+                        q["page"] = meta.get("page") or meta.get("page_number")
+                        q["chapter_id"] = meta.get("chapter_id")
+                        q["chapter_title"] = meta.get("chapter_title")
+                        q["material_id"] = meta.get("material_id")
+                        q["snippet"] = doc.page_content.strip()[:200]
                         batch_questions.append(q)
                     else:
                         print(f"Skipped (Validation): {msg}")

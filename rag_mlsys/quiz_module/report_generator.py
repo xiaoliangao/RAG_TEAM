@@ -142,6 +142,62 @@ def generate_fallback_feedback(report_data):
     return "### 1. 整体评价\n请复习错题。\n### 2. 核心薄弱点\n基础概念。\n### 3. 针对性建议\n多看书。\n### 4. 下一步行动\n无。"
 
 
+def generate_diagnostic_report(attempts: List[Dict[str, Any]]) -> str:
+    """基于最近的测验记录生成 Markdown 诊断报告。"""
+    if not attempts:
+        return "目前暂无测验记录，完成至少一次测验后可以生成个性化学习诊断。"
+
+    recent_attempts = list(reversed(attempts[-20:]))
+    scores = [float(att.get("score_percentage", 0.0)) for att in recent_attempts]
+    attempt_count = len(recent_attempts)
+    avg_score = sum(scores) / attempt_count if attempt_count else 0.0
+    best_score = max(scores) if scores else 0.0
+    latest_score = scores[0] if scores else 0.0
+
+    md: List[str] = []
+    md.append("# 智能诊断报告")
+    md.append("")
+    md.append(f"- 累计测验次数：{attempt_count} 次")
+    md.append(f"- 平均分：{avg_score:.1f} 分")
+    md.append(f"- 最高分：{best_score:.1f} 分")
+    md.append(f"- 最近一次得分：{latest_score:.1f} 分")
+    md.append("")
+
+    wrong_examples: List[Dict[str, Any]] = []
+    for attempt in recent_attempts:
+        for q in attempt.get("questions", []):
+            if not q.get("is_correct"):
+                wrong_examples.append(q)
+        if len(wrong_examples) >= 5:
+            break
+
+    if wrong_examples:
+        md.append("## 典型错题回顾")
+        for idx, q in enumerate(wrong_examples[:5], 1):
+            stem = q.get("stem") or q.get("question") or "题干缺失"
+            md.append(f"{idx}. {stem}")
+            if q.get("correct"):
+                md.append(f"   - 正确答案：{q.get('correct')}")
+            if q.get("explanation"):
+                md.append(f"   - 解析：{q.get('explanation')}")
+            md.append("")
+    else:
+        md.append("## 典型错题回顾")
+        md.append("近期测验中错误较少，继续保持当前的复习节奏。")
+        md.append("")
+
+    md.append("## 学习建议")
+    if avg_score >= 85:
+        md.append("保持练习频率，并尝试在整本教材范围内完成更高难度的综合题目。")
+    elif avg_score >= 70:
+        md.append("建议回顾最近错题涉及的概念，结合教材内容做针对性复习，再完成 2-3 次完整测验以验证成效。")
+    else:
+        md.append("优先梳理基础概念，结合错题解析建立错因清单，并安排短周期重复测验以尽快提高正确率。")
+
+    md.append("尝试将错题中的概念整理成提问，交给 AI 助教进行深入讲解，以查漏补缺。")
+    return "\n".join(md)
+
+
 def prepare_chart_data(report_data):
     data = {
         "类别": ["✅ 答对", "❌ 答错"],

@@ -1,10 +1,107 @@
 # core_processing.py
 import os
 import re
-from typing import List, Optional
+from pathlib import Path
+from typing import List, Optional, Tuple
 from langchain_community.document_loaders import DirectoryLoader, PyMuPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
+
+CHAPTER_PATTERN = re.compile(
+    r"(第\s*[0-9一二三四五六七八九十百千零]+\s*(章|节|部分|篇))"
+    r"(?:[\s　]*[：:．.\-—]*\s*(?P<title>[^\n\r，。：；、]{2,40}))?"
+)
+
+def _slugify(text: str) -> str:
+    normalized = re.sub(r"\s+", "-", text.strip())
+    normalized = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff\-]+", "", normalized)
+    return normalized.lower().strip("-")
+
+def extract_chapter_title(text: str) -> Optional[str]:
+    # 只看前几行，避免匹配正文中的“第X章”
+    head = "\n".join(text.strip().splitlines()[:6])
+    match = CHAPTER_PATTERN.search(head)
+    if not match:
+        return None
+
+    # 基础部分：例如 “第6章”
+    base = match.group(1) or ""
+    base = re.sub(r"\s+", "", base).strip()
+
+    # 可选的标题后缀
+    suffix = match.group("title")
+    if suffix:
+        # 归一化空白和常见符号
+        suffix = re.sub(r"\s+", " ", suffix.strip())
+        suffix = suffix.strip("：:-—.·")
+
+        # 只保留常见字符，去掉明显乱码
+        suffix = re.sub(r"[^\u4e00-\u9fff0-9A-Za-z（）()·\- ]", "", suffix)
+        suffix = suffix.strip()
+
+        # 统计中文字符数量，如果太少就认为不可信
+        chinese_chars = re.findall(r"[\u4e00-\u9fff]", suffix)
+        if len(chinese_chars) < 2:
+            # 类似 “WHS RK” 这种就直接丢弃
+            suffix = ""
+
+    if suffix:
+        return f"{base} {suffix}"
+    else:
+        # 只返回 “第6章” 这种形式，用于归并“乱码页眉”
+        return base
+
+
+def _assign_chapter_metadata(
+    chunks: List[Document],
+    source_name: str,
+) -> None:
+    """Infer chapter metadata sequentially and annotate chunks in-place."""
+    material_id = _slugify(Path(source_name).stem or "material") or "material"
+    chapter_counter = 0
+    current_chapter_id: Optional[str] = None
+    current_title: Optional[str] = None
+
+    for chunk in chunks:
+        chunk.metadata.setdefault("material_id", material_id)
+        detected = chunk.metadata.get("chapter_title") or extract_chapter_title(
+            chunk.page_content
+        )
+        if detected:
+            if detected != current_title:
+                chapter_counter += 1
+                slug = _slugify(detected) or f"ch{chapter_counter}"
+                current_chapter_id = f"{material_id}-{slug}"
+                current_title = detected
+        if current_chapter_id:
+            chunk.metadata["chapter_id"] = current_chapter_id
+            chunk.metadata["chapter_title"] = current_title
+
+def _assign_page_chapter_metadata(
+    pages: List[Document],
+    source_name: str,
+) -> None:
+    material_id = _slugify(Path(source_name).stem or "material") or "material"
+    chapter_counter = 0
+    current_chapter_id: Optional[str] = None
+    current_title: Optional[str] = None
+
+    for page in pages:
+        page.metadata.setdefault("material_id", material_id)
+
+        detected = page.metadata.get("chapter_title") or extract_chapter_title(
+            page.page_content
+        )
+
+        if detected and detected != current_title:
+            chapter_counter += 1
+            slug = _slugify(detected) or f"ch{chapter_counter}"
+            current_chapter_id = f"{material_id}-{slug}"
+            current_title = detected
+
+        if current_chapter_id:
+            page.metadata.setdefault("chapter_id", current_chapter_id)
+            page.metadata.setdefault("chapter_title", current_title)
 
 def process_single_pdf(pdf_path: str, source_name: Optional[str] = None) -> List[Document]:
     """
@@ -28,6 +125,7 @@ def process_single_pdf(pdf_path: str, source_name: Optional[str] = None) -> List
         documents = loader.load()
         print(f"  ✓ 成功加载 {len(documents)} 个页面")
         
+        _assign_page_chapter_metadata(documents, source_name)
         # 2. 清洗文档
         cleaned_documents = clean_document_content(documents)
         print(f"  ✓ 清洗完成，保留 {len(cleaned_documents)} 个有效页面")
@@ -36,10 +134,11 @@ def process_single_pdf(pdf_path: str, source_name: Optional[str] = None) -> List
         all_chunks = split_text_into_chunks(cleaned_documents)
         print(f"  ✓ 分块完成，生成 {len(all_chunks)} 个知识片段")
         
-        # 4. 添加来源元数据（关键：用于后续追踪）
+        # 4. 添加来源与章节元数据
         for chunk in all_chunks:
             chunk.metadata['source'] = source_name
             chunk.metadata['original_path'] = pdf_path
+        _assign_chapter_metadata(all_chunks, source_name)
         
         return all_chunks
         
@@ -71,6 +170,10 @@ def process_directory(directory_path: str) -> List[Document]:
     
     documents = loader.load()
     print(f"成功加载了 {len(documents)} 个页面。")
+
+    for page in documents:
+        source_name = page.metadata.get("source") or os.path.basename(directory_path)
+        _assign_page_chapter_metadata([page], source_name)
     
     # 清洗和分块
     cleaned_documents = clean_document_content(documents)

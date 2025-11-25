@@ -1,112 +1,122 @@
-# MLTutor · 基于 RAG 的机器学习智能学习平台
+# MLTutor – AI 学习工作台
 
-MLTutor 是一个面向 **机器学习 / 深度学习自学者** 的智能学习平台，基于检索增强生成（RAG, Retrieval-Augmented Generation）方案构建。它将教材 PDF、向量检索、远程大语言模型和可视化学习反馈结合在一起，提供：
-
-- 📚 教材上传与知识库构建  
-- 🔍 基于 RAG 的可解释问答（智能助教）  
-- 📝 从教材自动生成选择题 / 判断题的「智能测验」  
-- 📈 根据测验结果生成的学习报告与知识点诊断  
-
-项目采用**前后端分离**架构：
-
-- 后端：`rag_mlsys/` · FastAPI + LangChain + Chroma，调用本地中文向量模型 + ModelScope DeepSeek Chat API  
-- 前端：`mltutor-web/` · Vite + React + TypeScript + Tailwind，提供类似产品级的多 Tab Web 界面  
+> 一个面向「机器学习 / 技术课程」的本地化 AI 学习与测评系统。  
+> 支持教材上传、RAG 问答、智能出题、错题重做和学习报告。
 
 ---
 
-## 功能总览
+## 功能概览
 
-### 1. 教材上传与知识库构建
+### 1. 教材与知识库
 
-- 支持上传 PDF 教材（例如《深度学习》《统计学习方法》《动手学深度学习》等）。
-- 通过 `core_processing.py` 将 PDF 切分为语义段落，并做清洗与质量过滤。
-- 使用本地中文向量模型 `bge-large-zh-v1.5` 生成向量，存入 `vector_db/`（Chroma）。
-- 内置了一组默认教材（见 `knowledge_base/`，实际仓库中为了减小体积已通过 `.gitignore` 排除）。
+- 支持上传 PDF（也可扩展到 Word / Markdown）
+- 自动切片与向量化，构建检索索引
+- 区分：
+  - 自定义教材（用户上传）
+  - 内置教材（项目预置 Demo）
+- 可在前端自由切换当前教材，所有测验与对话都基于当前教材进行
 
-### 2. 基于 RAG 的智能问答（Chat）
+### 2. 智能测验（Quiz Engine）
 
-- 前端 `ChatView` 提供类似聊天的界面：
-  - 上方：你的问题
-  - 中间：助教回答（Markdown 排版）
-  - 下方：检索到的文献出处列表（教材页码）
-- 后端 `rag_service.py` 负责：
-  - 从向量库（内置 + 上传教材）检索相关片段；
-  - 将片段拼接为上下文；
-  - 调用 `llm_client.py` 封装的 **ModelScope DeepSeek Chat API** 生成回答；
-  - 返回回答文本与引用来源列表。
-- 支持多轮对话，支持可配置的：
-  - Top-K 文档数量
-  - 温度（Temperature）
-  - 查询扩展（Query Expansion）
-  - Few-shot 示例
+- 题型支持：
+  - 选择题（单选）
+  - 判断题（True/False）
+- 可配置：
+  - 选择题数量
+  - 判断题数量
+  - 难度等级：基础 / 进阶 / 挑战
+  - 测验模式：
+    - 标准出题（基于教材自动生成）
+    - 错题重做（从历史错题中抽题）
+- 自动评卷，支持：
+  - 统计总分、正确 / 错误数
+  - 展示每题的正确答案与用户作答
+  - 展示教材原文片段（页码 + snippet）
+  - 错题解析（explanation）
 
-### 3. 智能测验（Quiz）
+### 3. 学习报告（Study Report）
 
-- 前端 `QuizView` 提供测验配置与答题界面：
-  - 题目数量（滑条）
-  - 难度：基础 / 进阶 / 挑战
-  - 出题教材：  
-    - 自动（最近上传教材优先）  
-    - 具体内置教材  
-    - 具体上传教材
-- 后端：
-  - 通过 `/api/quiz/generate` 接口生成题目。
-  - 使用 `quiz_module/question_generator.py`：
-    - 从当前选中的教材中检索「适合出题」的段落；
-    - 调用 DeepSeek 生成 JSON 格式的题目（题干、选项、正确项、解析）；
-    - 题目经过多轮过滤（去掉目录/版权页/纯数据/过于细节或无意义的数值题等）。
-- 前端对题目进行展示和作答：
-  - 选择题/判断题按钮样式高亮；
-  - 提交后显示每题对错、高亮正确答案，并显示解析；
-  - 底部显示总得分（百分制）。
+- 成绩总览与趋势：
+  - 累计测验次数
+  - 平均得分
+  - 历史最高
+  - 最近一次成绩
+  - 分数时间序列图（学习曲线）
+- 知识点掌握度：
+  - 基于测验结果推断当前知识点掌握水平
+  - 自动提取/聚合重点知识点标签
+- AI 诊断报告：
+  - 基于测验数据角色扮演「学习顾问」
+  - 输出 Markdown 格式的分析与建议
+  - 浏览器打印 / 导出 PDF 报告
+- 下一步建议：
+  - 自动生成若干「下一步可以问 AI 助教的问题」
+  - 点击即跳转到 Chat，继续针对性学习
 
-### 4. 学习报告（Report）
+### 4. AI 助教（Chat Assistant）
 
-- 前端 `ReportView` 展示学习情况概览：
-  - 测验次数、平均分、最高分、最近一次得分；
-  - 高频错误知识点/标签列表。
-- 后端：
-  - 使用 `learning_tracker.py` 记录每次测验的题目与得分（`analytics/quiz_history.json`）。
-  - `/api/report/overview` 汇总历史记录，计算统计指标与知识点聚合。
+- 支持围绕当前教材进行问答：
+  - 概念解释
+  - 知识点总结
+  - 例题讲解
+- 文本能力：
+  - Markdown 渲染（列表 / 标题 / 代码块等）
+  - LaTeX 公式渲染（MathJax）
+- 检索增强：
+  - 支持查询扩展（Query Expansion）  
+  - 支持多轮对话（利用历史对话作为上下文）
+  - 支持 Few-shot（使用示例规范答案风格）
+  - 支持 k-Top 文档数、temperature 等参数设置
 
 ---
 
-## 目录结构
+## 技术架构
 
-假设项目根目录结构如下（示例）：
+### 前端
 
-```text
-Project/
-├── rag_mlsys/          # 后端
-│   ├── main_app.py     # FastAPI
-│   ├── rag_service.py  # RAG 管线封装
-│   ├── llm_client.py   # ModelScope DeepSeek API 封装
-│   ├── core_processing.py 
-│   ├── quiz_module/
-│   │   ├── question_generator.py
-│   │   ├── evaluator.py
-│   │   ├── report_generator.py
-│   │   └── topic_clustering.py
-│   ├── learning_tracker.py
-│   ├── requirements.txt
-│   ├── models/         # 本地向量模型（bge-large-zh-v1.5）
-│   ├── vector_db/      # Chroma 向量库持久化目录
-│   ├── knowledge_base/ # 默认教材 PDF
-│   ├── uploaded_pdfs/  # 用户上传的 PDF
-│   └── analytics/      # 测验历史等
-└── mltutor-web/        # 前端
-    ├── index.html
-    ├── package.json
-    ├── vite.config.ts
-    └── src/
-        ├── App.tsx
-        ├── index.tsx
-        ├── index.css
-        ├── components/
-        │   ├── Sidebar.tsx
-        │   └── HeroSection.tsx
-        └── views/
-            ├── UploadView.tsx
-            ├── ChatView.tsx
-            ├── QuizView.tsx
-            └── ReportView.tsx
+- 框架：React + TypeScript
+- 构建工具：Vite
+- UI：
+  - Tailwind CSS
+  - lucide-react 图标
+  - Recharts（成绩走势图）
+- Markdown & 数学公式：
+  - marked.js（Markdown 渲染）
+  - MathJax（LaTeX 渲染）
+
+主文件结构（部分）：
+
+- `index.html`：应用入口，配置字体、MathJax、marked 等依赖
+- `src/main.tsx`：挂载 React 根节点
+- `src/App.tsx`：全局状态与视图路由（Upload / Quiz / Report / Chat）
+- `src/components/Sidebar.tsx`：侧边导航与系统工具
+- `src/components/HeroSection.tsx`：顶部状态展示（当前教材、引擎状态、对话轮次）
+- `src/views/UploadView.tsx`：教材上传与知识库管理
+- `src/views/QuizView.tsx`：测验配置、出题、答题、解析
+- `src/views/ReportView.tsx`：学习报告、诊断与 PDF 导出
+- `src/views/ChatView.tsx`：AI 助教聊天界面
+
+### 后端
+
+主要模块：
+
+- `main_app.py`：Web 服务入口（FastAPI）
+- `rag_service.py`：
+  - 文档切片 / 嵌入向量构建
+  - 检索接口（Top-K 文档）
+  - 索引存储与更新
+- `pdf_utils.py`：PDF 解析与文本抽取
+- `question_generator.py`：
+  - 基于教材内容生成选择题 / 判断题
+  - 控制难度 / 题型分布
+- `evaluator.py`：
+  - 评卷逻辑
+  - 错题记录
+- `report_generator.py` / `learning_tracker.py` / `topic_clustering.py`：
+  - 成绩统计
+  - 学习曲线数据聚合
+  - 知识点聚类 / 学习建议生成
+- `background_processor.py`：
+  - 背景任务（例如大文件索引构建）
+- `rag_service.py` / `module_rag_assistant.py`：
+  - 提供给 Chat / Quiz / Report 的统一检索能力
